@@ -1,10 +1,12 @@
-# Casper
+# Casper 👻 v1.0
 
-Casper is a comprehensive API security testing tool written in Go. It helps prevent incorrect API implementations by validating and testing APIs using OpenAPI specifications.
+Casper is a comprehensive API security testing tool written in Go. It helps prevent incorrect API implementations by validating and testing APIs using OpenAPI specifications, domain crawling, or direct base URL testing.
 
 ## Features
 
 - OpenAPI/Swagger specification validation
+- Domain-based API discovery and testing
+- Direct base URL testing support
 - Comprehensive security testing suite
 - Business logic validation
 - Detailed security reporting
@@ -27,37 +29,34 @@ go build -o casper ./cmd/casper
 
 ## Usage
 
-### Basic Usage
+### Spec-Based Testing
 
 ```bash
-# Validate an OpenAPI specification
-./casper validate [spec-file]
+# Test using OpenAPI specification
+./casper -input api-spec.yaml -base-url http://api.example.com
 
-# Run all security tests
-./casper test [spec-file] --base-url [api-url]
-```
-
-### Advanced Options
-
-```bash
 # Run with debug logging
-./casper test [spec-file] --base-url [api-url] --debug
-
-# Skip specific test categories
-./casper test [spec-file] --base-url [api-url] --skip security,business
-
-# Specify output report file
-./casper test [spec-file] --base-url [api-url] --output report.json
+./casper -input api-spec.yaml -base-url http://api.example.com -debug
 ```
 
-### Example
+### Domain-Based Testing
 
 ```bash
-# Test a local API
-./casper test examples/petstore.yaml --base-url http://localhost:8080
+# Test entire domain with automatic API discovery
+./casper -input example.com
 
-# Test with debug output
-./casper test examples/petstore.yaml --base-url http://api.example.com --debug
+# Test with authentication
+./casper -input example.com -auth your-token
+```
+
+### Direct Base URL Testing
+
+```bash
+# Test specific API endpoint or base path
+./casper -base-url http://api.example.com/v1
+
+# Test with custom output file
+./casper -base-url http://api.example.com/v1 -output custom-report.json
 ```
 
 ## Project Structure
@@ -66,6 +65,7 @@ go build -o casper ./cmd/casper
 casper/
 ├── cmd/casper/         # CLI implementation
 ├── internal/
+│   ├── crawler/        # API discovery
 │   ├── validator/      # OpenAPI validation
 │   ├── security/       # Security testing
 │   │   ├── core/      # Core security tests
@@ -73,6 +73,7 @@ casper/
 │   │   ├── graphql/   # GraphQL-specific tests
 │   │   ├── static/    # Static resource tests
 │   │   ├── export/    # Export functionality tests
+│   │   ├── specless/  # Spec-less testing
 │   │   └── security.go # Main orchestrator
 │   ├── business/      # Business logic testing
 │   └── reporter/      # Report generation
