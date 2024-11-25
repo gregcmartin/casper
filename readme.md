@@ -4,27 +4,40 @@ Casper is a comprehensive API security testing tool written in Go. It helps prev
 
 ## Features
 
-- **OpenAPI Validation**: Comprehensive validation of OpenAPI/Swagger specifications
-- **Security Testing**:
-  - Authentication bypass detection
-  - SQL injection testing
-  - XSS vulnerability scanning
-  - CORS misconfiguration checks
-  - Information disclosure detection
-  - Mass assignment vulnerability testing
-  - SSRF vulnerability detection
-  - JWT security testing
-  - Rate limiting checks
-- **Business Logic Testing**:
-  - Resource dependency validation
-  - State transition checks
-  - Data consistency verification
-  - Access control testing
-- **Detailed Reporting**:
-  - Severity-based categorization
-  - Test coverage statistics
-  - Category-based issue tracking
-  - Comprehensive test summaries
+### Authentication & Authorization
+- Authentication bypass detection
+- JWT security testing
+- OAuth implementation validation
+- Brute force protection testing
+- Session management security
+- Password policy validation
+
+### Injection & XSS Protection
+- SQL injection testing
+- Cross-Site Scripting (XSS) detection
+- Server-Side Request Forgery (SSRF) testing
+- Mass assignment vulnerability checks
+- Input validation testing
+
+### Security Headers & Configuration
+- CORS misconfiguration detection
+- HTTP security headers validation
+- Content security testing
+- TLS configuration validation
+- HSTS implementation checks
+
+### API Design Security
+- Rate limiting validation
+- API versioning checks
+- Information disclosure detection
+- Error handling security
+- File upload security
+
+### Data Protection
+- Data encryption validation
+- Content type security
+- SSL/TLS stripping protection
+- DDOS protection testing
 
 ## Installation
 
@@ -76,6 +89,47 @@ go build -o casper ./cmd/casper
 # Run only security tests
 ./casper test examples/petstore.yaml --base-url http://api.example.com --skip business
 ```
+
+## Security Tests
+
+### Authentication Tests
+- Token-based authentication validation
+- OAuth 2.0 implementation security
+- JWT implementation security
+- Session management security
+- Password policy enforcement
+- Brute force protection
+
+### Injection Prevention Tests
+- SQL injection vectors
+- NoSQL injection vectors
+- Command injection
+- XSS payloads
+- SSRF vulnerabilities
+- Mass assignment vulnerabilities
+
+### Security Configuration Tests
+- CORS policy validation
+- Security headers verification
+- TLS configuration
+- HSTS implementation
+- Content security policy
+- X-Frame-Options
+
+### API Security Tests
+- Rate limiting implementation
+- API versioning security
+- Information disclosure
+- Error handling security
+- File upload restrictions
+- HTTP method restrictions
+
+### Data Protection Tests
+- Data encryption validation
+- Sensitive data exposure
+- SSL/TLS implementation
+- DDOS protection
+- Content type security
 
 ## Report Format
 
