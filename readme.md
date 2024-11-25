@@ -4,75 +4,15 @@ Casper is a comprehensive API security testing tool written in Go. It helps prev
 
 ## Features
 
-### Core Security Tests
-- Authentication & Authorization
-  * Multiple authentication endpoint testing
-  * Token-based authentication validation
-  * Authorization bypass detection
-  * Function level authorization testing
-- Input Validation & Injection
-  * SQL injection testing
-  * XSS vulnerability detection
-  * Command injection testing
-  * Input validation bypass attempts
-- Security Headers & Configuration
-  * CORS misconfiguration detection
-  * Security headers validation
-  * TLS configuration testing
-  * HSTS implementation checks
+- OpenAPI/Swagger specification validation
+- Comprehensive security testing suite
+- Business logic validation
+- Detailed security reporting
+- GraphQL security testing
+- Static resource security
+- Export functionality testing
 
-### Parameter-Based Tests
-- ID and Reference Testing
-  * GUID/UUID bypass attempts
-  * Numeric ID substitution
-  * Array wrapping vulnerabilities
-  * JSON object wrapping
-- Parameter Manipulation
-  * Parameter pollution
-  * JSON parameter pollution
-  * Wildcard testing
-  * Content type manipulation
-- Version Testing
-  * API version testing
-  * Version parameter manipulation
-  * Environment detection
-  * Non-production environment testing
-
-### GraphQL Security Tests
-- Schema Analysis
-  * Introspection testing
-  * Field suggestion detection
-  * Query depth analysis
-  * Query complexity testing
-- GraphQL-Specific
-  * Batch query testing
-  * Field level authorization
-  * Query validation
-  * Mutation testing
-
-### Static Resource Tests
-- Resource Access
-  * Direct resource access testing
-  * Path traversal detection
-  * Resource authorization testing
-  * Cross-user access attempts
-- File Handling
-  * File type validation
-  * Upload restrictions
-  * Resource enumeration
-  * Access control verification
-
-### Export Functionality Tests
-- Export Injection
-  * PDF export injection
-  * CSV export injection
-  * HTML export injection
-  * Template injection
-- Format Testing
-  * Export parameter manipulation
-  * Format validation
-  * Path traversal in exports
-  * File inclusion testing
+For detailed information about security tests, see [TESTS.md](TESTS.md).
 
 ## Installation
 
@@ -120,47 +60,23 @@ go build -o casper ./cmd/casper
 ./casper test examples/petstore.yaml --base-url http://api.example.com --debug
 ```
 
-## Security Test Categories
+## Project Structure
 
-### Authentication Tests
-- Multiple authentication endpoint testing
-- Token manipulation and validation
-- Session management security
-- OAuth implementation testing
-- JWT security validation
-- Authentication bypass attempts
-
-### Authorization Tests
-- Role-based access control
-- Function level authorization
-- Resource-level permissions
-- Cross-user access attempts
-- Privilege escalation tests
-- Authorization bypass detection
-
-### Injection Prevention Tests
-- SQL injection vectors
-- NoSQL injection
-- Command injection
-- XSS payloads
-- SSRF vulnerabilities
-- Template injection
-
-### API Security Tests
-- Rate limiting implementation
-- API versioning security
-- Information disclosure
-- Error handling security
-- Input validation
-- Output encoding
-
-### Data Protection Tests
-- Data encryption validation
-- Sensitive data exposure
-- SSL/TLS implementation
-- DDOS protection
-- Content security
-- File upload security
+```
+casper/
+├── cmd/casper/         # CLI implementation
+├── internal/
+│   ├── validator/      # OpenAPI validation
+│   ├── security/       # Security testing
+│   │   ├── core/      # Core security tests
+│   │   ├── parameter/ # Parameter-based tests
+│   │   ├── graphql/   # GraphQL-specific tests
+│   │   ├── static/    # Static resource tests
+│   │   ├── export/    # Export functionality tests
+│   │   └── security.go # Main orchestrator
+│   ├── business/      # Business logic testing
+│   └── reporter/      # Report generation
+```
 
 ## Report Format
 
@@ -183,13 +99,6 @@ Example report structure:
     "issues_by_category": {
       "SECURITY": 3,
       "BUSINESS_LOGIC": 2
-    },
-    "test_coverage": {
-      "AUTHENTICATION": {
-        "tests_run": 10,
-        "tests_passed": 8,
-        "tests_failed": 2
-      }
     }
   },
   "issues": [
