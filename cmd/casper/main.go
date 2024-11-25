@@ -21,11 +21,16 @@ import (
 )
 
 var (
-	baseURL    string
-	outputFile string
-	logger     *logrus.Logger
-	debug      bool
-	skipTests  []string
+	baseURL          string
+	outputFile       string
+	logger           *logrus.Logger
+	debug            bool
+	skipTests        []string
+	skipValidation   bool
+	skipURLEncode    bool
+	mode             string
+	noSpecValidation bool
+	rawOutput        bool
 )
 
 var rootCmd = &cobra.Command{
@@ -41,6 +46,11 @@ var validateCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		specPath := args[0]
+
+		if skipValidation {
+			logger.Info("Skipping validation as requested")
+			return
+		}
 
 		// Ensure the file exists
 		if _, err := os.Stat(specPath); os.IsNotExist(err) {
@@ -62,55 +72,97 @@ var validateCmd = &cobra.Command{
 var testCmd = &cobra.Command{
 	Use:   "test [OpenAPI spec file]",
 	Short: "Run security and business logic tests against an API",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		if baseURL == "" {
 			logger.Error("Base URL is required for testing")
 			os.Exit(1)
 		}
 
-		specPath := args[0]
-
-		// Ensure the file exists
-		if _, err := os.Stat(specPath); os.IsNotExist(err) {
-			logger.Errorf("Specification file not found: %s", specPath)
-			os.Exit(1)
-		}
-
-		// First validate the spec
-		v := validator.New(logger)
-		if err := v.ValidateSpec(specPath); err != nil {
-			logger.Errorf("Specification validation failed: %v", err)
-			os.Exit(1)
-		}
-
 		// Initialize the reporter
 		r := reporter.New(logger)
 
-		// Run security tests if not skipped
-		if !contains(skipTests, "security") {
-			logger.Info("Running security tests...")
-			tester := security.New(logger, baseURL)
-			if err := tester.RunTests(specPath); err != nil {
-				logger.Errorf("Security testing failed: %v", err)
+		// Initialize security tester
+		tester := security.New(logger, baseURL)
+
+		// Handle different test modes
+		switch mode {
+		case "core":
+			logger.Info("Running core security tests...")
+			if len(args) > 0 && !noSpecValidation {
+				if err := tester.RunTests(args[0]); err != nil {
+					logger.Errorf("Core security testing failed: %v", err)
+					os.Exit(1)
+				}
+			} else {
+				if err := tester.RunTestsWithoutSpec(); err != nil {
+					logger.Errorf("Core security testing failed: %v", err)
+					os.Exit(1)
+				}
+			}
+		case "direct":
+			logger.Info("Running direct API tests...")
+			if err := tester.RunDirectTests(skipURLEncode); err != nil {
+				logger.Errorf("Direct testing failed: %v", err)
 				os.Exit(1)
 			}
-		}
-
-		// Run business logic tests if not skipped
-		if !contains(skipTests, "business") {
-			logger.Info("Running business logic tests...")
-			bizTester := business.New(logger, baseURL)
-			if err := bizTester.RunTests(specPath); err != nil {
-				logger.Errorf("Business logic testing failed: %v", err)
+		case "raw":
+			logger.Info("Running raw security tests...")
+			if err := tester.RunRawTests(); err != nil {
+				logger.Errorf("Raw testing failed: %v", err)
 				os.Exit(1)
+			}
+		default:
+			// Default full testing mode
+			if len(args) == 0 {
+				logger.Error("OpenAPI spec file is required for full testing mode")
+				os.Exit(1)
+			}
+
+			specPath := args[0]
+
+			// Ensure the file exists
+			if _, err := os.Stat(specPath); os.IsNotExist(err) {
+				logger.Errorf("Specification file not found: %s", specPath)
+				os.Exit(1)
+			}
+
+			// Validate spec unless skipped
+			if !skipValidation && !noSpecValidation {
+				v := validator.New(logger)
+				if err := v.ValidateSpec(specPath); err != nil {
+					logger.Errorf("Specification validation failed: %v", err)
+					os.Exit(1)
+				}
+			}
+
+			// Run security tests if not skipped
+			if !contains(skipTests, "security") {
+				logger.Info("Running security tests...")
+				if err := tester.RunTests(specPath); err != nil {
+					logger.Errorf("Security testing failed: %v", err)
+					os.Exit(1)
+				}
+			}
+
+			// Run business logic tests if not skipped
+			if !contains(skipTests, "business") {
+				logger.Info("Running business logic tests...")
+				bizTester := business.New(logger, baseURL)
+				if err := bizTester.RunTests(specPath); err != nil {
+					logger.Errorf("Business logic testing failed: %v", err)
+					os.Exit(1)
+				}
 			}
 		}
 
 		// Generate report
 		if outputFile == "" {
-			outputFile = fmt.Sprintf("casper-report-%s.json",
-				filepath.Base(specPath))
+			outputFile = "casper-report.json"
+			if len(args) > 0 {
+				outputFile = fmt.Sprintf("casper-report-%s.json",
+					filepath.Base(args[0]))
+			}
 		}
 
 		if err := r.GenerateReport(outputFile); err != nil {
@@ -129,8 +181,13 @@ var discoverCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		domain := args[0]
 
-		// Initialize crawler
+		// Initialize crawler with options
 		c := crawler.New(logger)
+		c.SetOptions(crawler.Options{
+			SkipValidation: skipValidation || noSpecValidation,
+			SkipURLEncode:  skipURLEncode,
+			RawOutput:      rawOutput,
+		})
 
 		// Discover APIs
 		result, err := c.DiscoverAPIs(domain)
@@ -220,7 +277,7 @@ var discoverCmd = &cobra.Command{
 		logger.Infof("Discovery completed. Report saved to: %s", outputFile)
 
 		// If specs were found and downloaded, validate and test them
-		if len(downloadedSpecs) > 0 {
+		if len(downloadedSpecs) > 0 && !skipValidation && !noSpecValidation {
 			logger.Info("Starting validation and testing of discovered specs...")
 
 			v := validator.New(logger)
@@ -301,10 +358,28 @@ func init() {
 		"Output file for the security report (default: casper-report-<spec>.json)")
 	testCmd.Flags().StringSliceVarP(&skipTests, "skip", "s", []string{},
 		"Skip specific test categories (security, business)")
+	testCmd.Flags().BoolVar(&skipValidation, "skip-validation", false,
+		"Skip OpenAPI specification validation")
+	testCmd.Flags().BoolVar(&skipURLEncode, "no-url-encode", false,
+		"Disable automatic URL encoding")
+	testCmd.Flags().StringVarP(&mode, "mode", "m", "",
+		"Test mode (core, direct, raw)")
+	testCmd.Flags().BoolVar(&noSpecValidation, "skip-spec-validation", false,
+		"Skip all specification validation")
+	testCmd.Flags().BoolVar(&rawOutput, "raw-output", false,
+		"Output raw test results")
 
 	// Add discover command flags
 	discoverCmd.Flags().StringVarP(&outputFile, "output", "o", "",
 		"Output file for the discovery report (default: casper-discovery-<domain>.json)")
+	discoverCmd.Flags().BoolVar(&skipValidation, "skip-validation", false,
+		"Skip OpenAPI specification validation")
+	discoverCmd.Flags().BoolVar(&skipURLEncode, "no-url-encode", false,
+		"Disable automatic URL encoding")
+	discoverCmd.Flags().BoolVar(&noSpecValidation, "skip-spec-validation", false,
+		"Skip all specification validation")
+	discoverCmd.Flags().BoolVar(&rawOutput, "raw-output", false,
+		"Output raw discovery results")
 
 	// Add commands
 	rootCmd.AddCommand(validateCmd)

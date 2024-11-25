@@ -26,6 +26,7 @@ type Tester struct {
 	exportTester  *export.Tester
 	bolaTester    *bola.Tester
 	vulnTester    *vuln.Tester
+	baseURL       string
 }
 
 // New creates a new security tester instance
@@ -46,6 +47,7 @@ func New(logger *logrus.Logger, baseURL string) *Tester {
 
 	return &Tester{
 		logger:        logger,
+		baseURL:       baseURL,
 		coreTester:    core.New(logger, client, baseURL),
 		paramTester:   parameter.New(logger, client, baseURL),
 		graphqlTester: graphql.New(logger, client, baseURL),
@@ -56,7 +58,7 @@ func New(logger *logrus.Logger, baseURL string) *Tester {
 	}
 }
 
-// RunTests performs all security tests against the API
+// RunTests performs all security tests against the API using a spec file
 func (t *Tester) RunTests(specPath string) error {
 	t.logger.Info("Starting comprehensive security tests")
 
@@ -109,6 +111,61 @@ func (t *Tester) RunTests(specPath string) error {
 		if err := t.exportTester.RunTests(exportPaths); err != nil {
 			t.logger.Warn("Export functionality testing failed:", err)
 		}
+	}
+
+	return nil
+}
+
+// RunTestsWithoutSpec performs security tests without requiring a spec file
+func (t *Tester) RunTestsWithoutSpec() error {
+	t.logger.Info("Starting security tests without spec")
+
+	// Run core security tests on base URL
+	if err := t.coreTester.RunTestsWithoutSpec(); err != nil {
+		return err
+	}
+
+	// Run basic vulnerability tests
+	if err := t.vulnTester.RunTests([]string{"/"}); err != nil {
+		t.logger.Warn("Basic vulnerability testing failed:", err)
+	}
+
+	return nil
+}
+
+// RunDirectTests performs direct API testing without spec validation
+func (t *Tester) RunDirectTests(skipURLEncode bool) error {
+	t.logger.Info("Starting direct API tests")
+
+	// Configure URL encoding
+	t.coreTester.SetURLEncoding(!skipURLEncode)
+	t.paramTester.SetURLEncoding(!skipURLEncode)
+
+	// Run core security tests directly
+	if err := t.coreTester.RunDirectTests(); err != nil {
+		return err
+	}
+
+	// Run parameter tests directly
+	if err := t.paramTester.RunDirectTests(); err != nil {
+		t.logger.Warn("Direct parameter testing failed:", err)
+	}
+
+	return nil
+}
+
+// RunRawTests performs raw security testing without any validation
+func (t *Tester) RunRawTests() error {
+	t.logger.Info("Starting raw security tests")
+
+	// Run raw core tests
+	if err := t.coreTester.RunRawTests(); err != nil {
+		return err
+	}
+
+	// Run raw vulnerability tests
+	if err := t.vulnTester.RunTests([]string{"/"}); err != nil {
+		t.logger.Warn("Raw vulnerability testing failed:", err)
 	}
 
 	return nil

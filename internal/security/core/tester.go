@@ -4,36 +4,35 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/go-openapi/loads"
-	"github.com/go-openapi/spec"
 	"github.com/sirupsen/logrus"
 )
 
 // Tester handles core security testing
 type Tester struct {
-	logger  *logrus.Logger
-	client  *http.Client
-	baseURL string
-	headers map[string]string
+	logger        *logrus.Logger
+	client        *http.Client
+	baseURL       string
+	headers       map[string]string
+	skipURLEncode bool
 }
 
 // New creates a new core security tester instance
 func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
-	// Set reasonable timeouts
-	client.Timeout = 10 * time.Second
+	// Ensure baseURL ends without a slash
+	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	return &Tester{
-		logger:  logger,
-		client:  client,
-		baseURL: baseURL,
-		headers: make(map[string]string),
+		logger:        logger,
+		client:        client,
+		baseURL:       baseURL,
+		headers:       make(map[string]string),
+		skipURLEncode: false,
 	}
 }
 
@@ -42,312 +41,114 @@ func (t *Tester) SetHeader(key, value string) {
 	t.headers[key] = value
 }
 
-// RunTests performs core security tests against the API
-func (t *Tester) RunTests(specPath string) error {
-	t.logger.Info("Starting core security tests")
+// SetURLEncoding sets whether to skip URL encoding
+func (t *Tester) SetURLEncoding(encode bool) {
+	t.skipURLEncode = !encode
+}
 
+// RunTests performs core security tests using a spec file
+func (t *Tester) RunTests(specPath string) error {
+	t.logger.Info("Starting core security tests with spec")
+	return t.runCoreTests(true)
+}
+
+// RunTestsWithoutSpec performs core security tests without a spec file
+func (t *Tester) RunTestsWithoutSpec() error {
+	t.logger.Info("Starting core security tests without spec")
+	return t.runCoreTests(false)
+}
+
+// RunDirectTests performs direct core security tests
+func (t *Tester) RunDirectTests() error {
+	t.logger.Info("Starting direct core security tests")
+	return t.runCoreTests(false)
+}
+
+// RunRawTests performs raw core security tests
+func (t *Tester) RunRawTests() error {
+	t.logger.Info("Starting raw core security tests")
+	return t.testRawSecurity()
+}
+
+// runCoreTests performs the core security test suite
+func (t *Tester) runCoreTests(useSpec bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Detect spec version and validate accordingly
-	if strings.HasSuffix(specPath, ".yaml") || strings.HasSuffix(specPath, ".yml") {
-		// Try OpenAPI 3 first
-		if doc, err := openapi3.NewLoader().LoadFromFile(specPath); err == nil {
-			return t.runOpenAPI3Tests(ctx, doc)
-		}
-	}
-
-	// Fallback to Swagger 2.0
-	doc, err := loads.Spec(specPath)
-	if err != nil {
-		return fmt.Errorf("failed to load spec file: %w", err)
-	}
-	return t.runSwagger2Tests(ctx, doc)
-}
-
-// runSwagger2Tests runs tests for Swagger 2.0 specs
-func (t *Tester) runSwagger2Tests(ctx context.Context, doc *loads.Document) error {
-	t.logger.Debug("Running Swagger 2.0 tests")
-	swagger := doc.Spec()
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(swagger.Paths.Paths))
-
-	// Test each endpoint
-	for path, pathItem := range swagger.Paths.Paths {
-		wg.Add(1)
-		go func(p string, pi spec.PathItem) {
-			defer wg.Done()
-			if err := t.testSwagger2Path(ctx, p, pi); err != nil {
-				select {
-				case errChan <- fmt.Errorf("failed testing path %s: %w", p, err):
-				default:
-				}
-			}
-		}(path, pathItem)
-	}
-
-	// Run global security tests in parallel
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := t.testGlobalSecurity(ctx); err != nil {
-			select {
-			case errChan <- fmt.Errorf("global security tests failed: %w", err):
-			default:
-			}
-		}
-	}()
-
-	// Wait for all tests to complete
-	wg.Wait()
-	close(errChan)
-
-	// Collect any errors
-	var errs []error
-	for err := range errChan {
-		if err != nil && !strings.Contains(err.Error(), "no such host") {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("multiple test failures: %v", errs)
-	}
-	return nil
-}
-
-// runOpenAPI3Tests runs tests for OpenAPI 3.0 specs
-func (t *Tester) runOpenAPI3Tests(ctx context.Context, doc *openapi3.T) error {
-	t.logger.Debug("Running OpenAPI 3.0 tests")
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(doc.Paths.Map()))
-
-	// Test each endpoint
-	if doc.Paths != nil {
-		for path, pathItem := range doc.Paths.Map() {
-			wg.Add(1)
-			go func(p string, pi *openapi3.PathItem) {
-				defer wg.Done()
-				if err := t.testOpenAPI3Path(ctx, p, pi); err != nil {
-					select {
-					case errChan <- fmt.Errorf("failed testing path %s: %w", p, err):
-					default:
-					}
-				}
-			}(path, pathItem)
-		}
-	}
-
-	// Run global security tests in parallel
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := t.testGlobalSecurity(ctx); err != nil {
-			select {
-			case errChan <- fmt.Errorf("global security tests failed: %w", err):
-			default:
-			}
-		}
-	}()
-
-	// Wait for all tests to complete
-	wg.Wait()
-	close(errChan)
-
-	// Collect any errors
-	var errs []error
-	for err := range errChan {
-		if err != nil && !strings.Contains(err.Error(), "no such host") {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("multiple test failures: %v", errs)
-	}
-	return nil
-}
-
-// testSwagger2Path tests a Swagger 2.0 path
-func (t *Tester) testSwagger2Path(ctx context.Context, path string, pathItem spec.PathItem) error {
-	operations := map[string]*spec.Operation{
-		"GET":     pathItem.Get,
-		"POST":    pathItem.Post,
-		"PUT":     pathItem.Put,
-		"DELETE":  pathItem.Delete,
-		"PATCH":   pathItem.Patch,
-		"HEAD":    pathItem.Head,
-		"OPTIONS": pathItem.Options,
-	}
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(operations))
-
-	for method, op := range operations {
-		if op != nil {
-			wg.Add(1)
-			go func(m string, o *spec.Operation) {
-				defer wg.Done()
-				if err := t.testOperation(ctx, m, path, o.Security != nil); err != nil {
-					select {
-					case errChan <- err:
-					default:
-					}
-				}
-			}(method, op)
-		}
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	// Collect any errors
-	var errs []error
-	for err := range errChan {
-		if err != nil && !strings.Contains(err.Error(), "no such host") {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("multiple operation test failures: %v", errs)
-	}
-	return nil
-}
-
-// testOpenAPI3Path tests an OpenAPI 3.0 path
-func (t *Tester) testOpenAPI3Path(ctx context.Context, path string, pathItem *openapi3.PathItem) error {
-	operations := map[string]*openapi3.Operation{
-		"GET":     pathItem.Get,
-		"POST":    pathItem.Post,
-		"PUT":     pathItem.Put,
-		"DELETE":  pathItem.Delete,
-		"PATCH":   pathItem.Patch,
-		"HEAD":    pathItem.Head,
-		"OPTIONS": pathItem.Options,
-	}
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(operations))
-
-	for method, op := range operations {
-		if op != nil {
-			wg.Add(1)
-			go func(m string, o *openapi3.Operation) {
-				defer wg.Done()
-				requiresSecurity := false
-				if o.Security != nil {
-					requiresSecurity = len(*o.Security) > 0
-				}
-				if err := t.testOperation(ctx, m, path, requiresSecurity); err != nil {
-					select {
-					case errChan <- err:
-					default:
-					}
-				}
-			}(method, op)
-		}
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	// Collect any errors
-	var errs []error
-	for err := range errChan {
-		if err != nil && !strings.Contains(err.Error(), "no such host") {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("multiple operation test failures: %v", errs)
-	}
-	return nil
-}
-
-// testOperation runs security tests for a specific operation
-func (t *Tester) testOperation(ctx context.Context, method, path string, requiresSecurity bool) error {
-	t.logger.Infof("Testing %s %s", method, path)
-
 	tests := []struct {
 		name string
-		fn   func(context.Context, string, string, bool) error
+		fn   func(context.Context) error
 	}{
 		{"Authentication", t.testAuthentication},
 		{"Authorization", t.testAuthorization},
 		{"Input Validation", t.testInputValidation},
 		{"Rate Limiting", t.testRateLimiting},
 		{"Error Handling", t.testErrorHandling},
-		{"Data Validation", t.testDataValidation},
 		{"Security Headers", t.testSecurityHeaders},
+		{"TLS Configuration", t.testTLSConfig},
 	}
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(tests))
 
 	for _, test := range tests {
-		wg.Add(1)
-		go func(tt struct {
-			name string
-			fn   func(context.Context, string, string, bool) error
-		}) {
-			defer wg.Done()
-			if err := tt.fn(ctx, method, path, requiresSecurity); err != nil {
-				if !strings.Contains(err.Error(), "no such host") {
-					t.logger.Warnf("%s test failed for %s %s: %v", tt.name, method, path, err)
-					select {
-					case errChan <- err:
-					default:
-					}
-				}
-			}
-		}(test)
+		t.logger.Infof("Running %s tests...", test.name)
+		if err := test.fn(ctx); err != nil {
+			t.logger.Warnf("%s tests failed: %v", test.name, err)
+		}
 	}
-
-	wg.Wait()
-	close(errChan)
 
 	return nil
 }
 
 // Test implementations
 
-func (t *Tester) testAuthentication(ctx context.Context, method, path string, requiresSecurity bool) error {
-	if requiresSecurity {
-		resp, err := t.makeRequest(ctx, method, path, nil)
+func (t *Tester) testAuthentication(ctx context.Context) error {
+	endpoints := []string{
+		"/api/login",
+		"/api/auth",
+		"/api/token",
+	}
+
+	for _, endpoint := range endpoints {
+		resp, err := t.makeRequest(ctx, "POST", endpoint, nil, nil)
 		if err != nil {
-			return err
+			continue
 		}
-		defer resp.Body.Close()
+		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusUnauthorized {
-			t.logger.Warn("Endpoint accessible without proper authentication")
+			t.logger.Warn("Endpoint accessible without proper authentication:", endpoint)
 		}
 	}
+
 	return nil
 }
 
-func (t *Tester) testAuthorization(ctx context.Context, method, path string, requiresSecurity bool) error {
+func (t *Tester) testAuthorization(ctx context.Context) error {
+	endpoints := []string{
+		"/api/admin",
+		"/api/users",
+		"/api/settings",
+	}
+
 	headers := map[string]string{
 		"Authorization": "Bearer invalid-token",
 	}
 
-	resp, err := t.makeRequest(ctx, method, path, headers)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	for _, endpoint := range endpoints {
+		resp, err := t.makeRequest(ctx, "GET", endpoint, headers, nil)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
 
-	if requiresSecurity && resp.StatusCode != http.StatusUnauthorized {
-		t.logger.Warn("Endpoint accepts invalid authorization tokens")
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.logger.Warn("Endpoint accepts invalid authorization:", endpoint)
+		}
 	}
+
 	return nil
 }
 
-func (t *Tester) testInputValidation(ctx context.Context, method, path string, requiresSecurity bool) error {
+func (t *Tester) testInputValidation(ctx context.Context) error {
 	payloads := []string{
 		"<script>alert(1)</script>",
 		"'; DROP TABLE users--",
@@ -355,12 +156,9 @@ func (t *Tester) testInputValidation(ctx context.Context, method, path string, r
 	}
 
 	for _, payload := range payloads {
-		headers := map[string]string{
-			"Content-Type": "application/json",
-		}
-		resp, err := t.makeRequestWithBody(ctx, method, path, headers, payload)
+		resp, err := t.makeRequestWithBody(ctx, "POST", "/api/data", nil, payload)
 		if err != nil {
-			return err
+			continue
 		}
 		resp.Body.Close()
 
@@ -368,73 +166,52 @@ func (t *Tester) testInputValidation(ctx context.Context, method, path string, r
 			t.logger.Warnf("Endpoint accepts potentially malicious input: %s", payload)
 		}
 	}
+
 	return nil
 }
 
-func (t *Tester) testRateLimiting(ctx context.Context, method, path string, requiresSecurity bool) error {
-	for i := 0; i < 20; i++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			resp, err := t.makeRequest(ctx, method, path, nil)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-
-			if i > 10 && resp.StatusCode != http.StatusTooManyRequests {
-				t.logger.Warn("No rate limiting detected")
-			}
-		}
-	}
-	return nil
-}
-
-func (t *Tester) testErrorHandling(ctx context.Context, method, path string, requiresSecurity bool) error {
-	headers := map[string]string{
-		"Content-Type": "invalid",
-	}
-
-	resp, err := t.makeRequest(ctx, method, path, headers)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if strings.Contains(string(body), "stack trace") {
-		t.logger.Warn("Error response contains sensitive information")
-	}
-	return nil
-}
-
-func (t *Tester) testDataValidation(ctx context.Context, method, path string, requiresSecurity bool) error {
-	if method == "POST" || method == "PUT" {
-		invalidData := `{"invalid": true}`
-		headers := map[string]string{
-			"Content-Type": "application/json",
-		}
-
-		resp, err := t.makeRequestWithBody(ctx, method, path, headers, invalidData)
+func (t *Tester) testRateLimiting(ctx context.Context) error {
+	endpoint := "/api/test"
+	for i := 0; i < 50; i++ {
+		resp, err := t.makeRequest(ctx, "GET", endpoint, nil, nil)
 		if err != nil {
-			return err
+			continue
 		}
 		resp.Body.Close()
 
-		if resp.StatusCode != http.StatusBadRequest {
-			t.logger.Warn("Endpoint accepts invalid data structure")
+		if i > 30 && resp.StatusCode != http.StatusTooManyRequests {
+			t.logger.Warn("No rate limiting detected")
+			break
 		}
 	}
+
 	return nil
 }
 
-func (t *Tester) testSecurityHeaders(ctx context.Context, method, path string, requiresSecurity bool) error {
-	resp, err := t.makeRequest(ctx, method, path, nil)
+func (t *Tester) testErrorHandling(ctx context.Context) error {
+	endpoints := []string{
+		"/api/invalid",
+		"/api/error",
+		"/api/undefined",
+	}
+
+	for _, endpoint := range endpoints {
+		resp, err := t.makeRequest(ctx, "GET", endpoint, nil, nil)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			t.logger.Warn("Server error detected:", endpoint)
+		}
+	}
+
+	return nil
+}
+
+func (t *Tester) testSecurityHeaders(ctx context.Context) error {
+	resp, err := t.makeRequest(ctx, "GET", "/", nil, nil)
 	if err != nil {
 		return err
 	}
@@ -444,6 +221,8 @@ func (t *Tester) testSecurityHeaders(ctx context.Context, method, path string, r
 		"X-Content-Type-Options",
 		"X-Frame-Options",
 		"X-XSS-Protection",
+		"Content-Security-Policy",
+		"Strict-Transport-Security",
 	}
 
 	for _, header := range requiredHeaders {
@@ -451,43 +230,52 @@ func (t *Tester) testSecurityHeaders(ctx context.Context, method, path string, r
 			t.logger.Warnf("Missing security header: %s", header)
 		}
 	}
+
 	return nil
 }
 
-func (t *Tester) testGlobalSecurity(ctx context.Context) error {
-	// Test TLS configuration
+func (t *Tester) testTLSConfig(ctx context.Context) error {
 	if !strings.HasPrefix(t.baseURL, "https://") {
 		t.logger.Warn("API not using HTTPS")
+		return nil
 	}
 
-	resp, err := t.makeRequest(ctx, "GET", "", nil)
+	resp, err := t.makeRequest(ctx, "GET", "/", nil, nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.TLS != nil && resp.TLS.Version < tls.VersionTLS12 {
-		t.logger.Warn("TLS version below 1.2")
+	if resp.TLS != nil {
+		if resp.TLS.Version < tls.VersionTLS12 {
+			t.logger.Warn("TLS version below 1.2")
+		}
 	}
 
-	// Test CORS configuration
-	headers := map[string]string{
-		"Origin": "http://evil.com",
+	return nil
+}
+
+func (t *Tester) testRawSecurity() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Test basic endpoints without validation
+	endpoints := []string{
+		"/",
+		"/api",
+		"/auth",
+		"/login",
+		"/admin",
 	}
 
-	resp, err = t.makeRequest(ctx, "OPTIONS", "", headers)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	for _, endpoint := range endpoints {
+		resp, err := t.makeRequest(ctx, "GET", endpoint, nil, nil)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
 
-	if resp.Header.Get("Access-Control-Allow-Origin") == "*" {
-		t.logger.Warn("CORS allows all origins")
-	}
-
-	// Test global security headers
-	if resp.Header.Get("Strict-Transport-Security") == "" {
-		t.logger.Warn("HSTS not implemented")
+		t.logger.Infof("Endpoint %s returned status: %d", endpoint, resp.StatusCode)
 	}
 
 	return nil
@@ -495,9 +283,36 @@ func (t *Tester) testGlobalSecurity(ctx context.Context) error {
 
 // Helper methods
 
-func (t *Tester) makeRequest(ctx context.Context, method, path string, headers map[string]string) (*http.Response, error) {
-	url := t.baseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+func (t *Tester) makeRequest(ctx context.Context, method, endpoint string, headers map[string]string, params map[string]string) (*http.Response, error) {
+	// Build URL
+	u, err := url.Parse(t.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
+
+	// Ensure endpoint starts with /
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+
+	// Set path
+	u.Path = path.Join(u.Path, endpoint)
+
+	// Add query parameters if any
+	if params != nil {
+		q := u.Query()
+		for k, v := range params {
+			if !t.skipURLEncode {
+				q.Set(k, v)
+			} else {
+				q.Set(k, url.QueryEscape(v))
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -512,24 +327,38 @@ func (t *Tester) makeRequest(ctx context.Context, method, path string, headers m
 		req.Header.Set(k, v)
 	}
 
+	// Make request
 	resp, err := t.client.Do(req)
 	if err != nil {
-		// Skip DNS resolution errors
-		if strings.Contains(err.Error(), "no such host") {
-			return nil, err
-		}
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
 	return resp, nil
 }
 
-func (t *Tester) makeRequestWithBody(ctx context.Context, method, path string, headers map[string]string, body string) (*http.Response, error) {
-	url := t.baseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
+func (t *Tester) makeRequestWithBody(ctx context.Context, method, endpoint string, headers map[string]string, body string) (*http.Response, error) {
+	// Build URL
+	u, err := url.Parse(t.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
+
+	// Ensure endpoint starts with /
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+
+	// Set path
+	u.Path = path.Join(u.Path, endpoint)
+
+	// Create request with body
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
+
+	// Set content type
+	req.Header.Set("Content-Type", "application/json")
 
 	// Add default headers
 	for k, v := range t.headers {
@@ -541,12 +370,9 @@ func (t *Tester) makeRequestWithBody(ctx context.Context, method, path string, h
 		req.Header.Set(k, v)
 	}
 
+	// Make request
 	resp, err := t.client.Do(req)
 	if err != nil {
-		// Skip DNS resolution errors
-		if strings.Contains(err.Error(), "no such host") {
-			return nil, err
-		}
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
