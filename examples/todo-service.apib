@@ -1,0 +1,153 @@
+FORMAT: 1A
+HOST: https://api.todoservice.com
+
+# Todo Service API
+
+Todo Service API is a simple task management service.
+
+# Group Authentication
+
+## Login [/auth/login]
+
+### Login User [POST]
+Login with username and password to receive an access token.
+
++ Request (application/json)
+    + Attributes
+        + username: johndoe (string, required) - User's username
+        + password: secret123 (string, required) - User's password
+
++ Response 200 (application/json)
+    + Attributes
+        + token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9... (string) - JWT access token
+        + expires_in: 3600 (number) - Token expiration in seconds
+
+# Group Tasks
+
+## Tasks Collection [/tasks]
+
+### List All Tasks [GET]
+Get all tasks for the authenticated user.
+
++ Request
+    + Headers
+            Authorization: Bearer {token}
+
++ Response 200 (application/json)
+    + Attributes (array[Task])
+
+### Create a Task [POST]
+Create a new task.
+
++ Request (application/json)
+    + Headers
+            Authorization: Bearer {token}
+    
+    + Attributes
+        + title: Buy groceries (string, required) - Task title
+        + description: Get milk, bread, and eggs (string, optional) - Task description
+        + due_date: 2024-12-31 (string, optional) - Due date in YYYY-MM-DD format
+        + priority: medium (enum[string], optional)
+            + Members
+                + low
+                + medium
+                + high
+
++ Response 201 (application/json)
+    + Attributes (Task)
+
+## Task [/tasks/{task_id}]
+
++ Parameters
+    + task_id: 123 (string, required) - ID of the task
+
+### Get a Task [GET]
+Get a specific task by ID.
+
++ Request
+    + Headers
+            Authorization: Bearer {token}
+
++ Response 200 (application/json)
+    + Attributes (Task)
+
+### Update a Task [PUT]
+Update a specific task.
+
++ Request (application/json)
+    + Headers
+            Authorization: Bearer {token}
+    
+    + Attributes
+        + title: Buy more groceries (string, optional) - Updated task title
+        + description: Get milk, bread, eggs, and cheese (string, optional) - Updated description
+        + due_date: 2024-12-31 (string, optional) - Updated due date
+        + priority: high (enum[string], optional)
+            + Members
+                + low
+                + medium
+                + high
+        + completed: true (boolean, optional) - Task completion status
+
++ Response 200 (application/json)
+    + Attributes (Task)
+
+### Delete a Task [DELETE]
+Delete a specific task.
+
++ Request
+    + Headers
+            Authorization: Bearer {token}
+
++ Response 204
+
+# Group Tags
+
+## Tags Collection [/tags]
+
+### List All Tags [GET]
+Get all tags for the authenticated user.
+
++ Request
+    + Headers
+            Authorization: Bearer {token}
+
++ Response 200 (application/json)
+    + Attributes (array[Tag])
+
+### Create a Tag [POST]
+Create a new tag.
+
++ Request (application/json)
+    + Headers
+            Authorization: Bearer {token}
+    
+    + Attributes
+        + name: shopping (string, required) - Tag name
+        + color: #FF0000 (string, optional) - Tag color in hex format
+
++ Response 201 (application/json)
+    + Attributes (Tag)
+
+# Data Structures
+
+## Task
++ id: 123 (string) - Unique identifier
++ title: Buy groceries (string) - Task title
++ description: Get milk, bread, and eggs (string, optional) - Task description
++ due_date: 2024-12-31 (string, optional) - Due date
++ priority: medium (enum[string])
+    + Members
+        + low
+        + medium
+        + high
++ completed: false (boolean) - Task completion status
++ created_at: 2024-01-01T12:00:00Z (string) - Creation timestamp
++ updated_at: 2024-01-01T12:00:00Z (string) - Last update timestamp
++ tags (array[Tag], optional) - Associated tags
+
+## Tag
++ id: 456 (string) - Unique identifier
++ name: shopping (string) - Tag name
++ color: #FF0000 (string) - Tag color in hex format
++ created_at: 2024-01-01T12:00:00Z (string) - Creation timestamp

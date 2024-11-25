@@ -1,133 +1,155 @@
 package validator
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
-	"github.com/go-openapi/loads"
-	"github.com/go-openapi/spec"
-	"github.com/go-openapi/strfmt"
-	"github.com/go-openapi/validate"
 	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
-// Validator handles OpenAPI specification validation
+// Validator handles API specification validation
 type Validator struct {
-	logger *logrus.Logger
+	logger             *logrus.Logger
+	swagger2Validator  *Swagger2Validator
+	openapi3Validator  *OpenAPI3Validator
+	asyncValidator     *AsyncAPIValidator
+	graphqlValidator   *GraphQLValidator
+	ramlValidator      *RAMLValidator
+	blueprintValidator *BlueprintValidator
 }
 
 // New creates a new Validator instance
 func New(logger *logrus.Logger) *Validator {
 	return &Validator{
-		logger: logger,
+		logger:             logger,
+		swagger2Validator:  NewSwagger2Validator(logger),
+		openapi3Validator:  NewOpenAPI3Validator(logger),
+		asyncValidator:     NewAsyncAPIValidator(logger),
+		graphqlValidator:   NewGraphQLValidator(logger),
+		ramlValidator:      NewRAMLValidator(logger),
+		blueprintValidator: NewBlueprintValidator(logger),
 	}
 }
 
-// ValidateSpec validates an OpenAPI specification file
+// ValidateSpec validates an API specification file
 func (v *Validator) ValidateSpec(specPath string) error {
-	v.logger.Infof("Starting validation of OpenAPI spec: %s", specPath)
+	v.logger.Infof("Starting validation of API spec: %s", specPath)
 
-	// Load the specification
-	doc, err := loads.Spec(specPath)
+	// Detect format
+	format, err := v.detectFormat(specPath)
 	if err != nil {
-		return fmt.Errorf("failed to load spec file: %w", err)
+		return fmt.Errorf("format detection failed: %w", err)
 	}
-	v.logger.Debug("Successfully loaded spec file")
+	v.logger.Infof("Detected specification format: %s", format)
 
-	// Expand spec with full validation
-	if err := spec.ExpandSpec(doc.Spec(), &spec.ExpandOptions{RelativeBase: specPath}); err != nil {
-		return fmt.Errorf("failed to expand spec: %w", err)
+	var result *ValidationResult
+	switch format {
+	case FormatSwagger2:
+		result, err = v.swagger2Validator.Validate(specPath)
+	case FormatOpenAPI3:
+		result, err = v.openapi3Validator.Validate(specPath)
+	case FormatAsyncAPI:
+		result, err = v.asyncValidator.Validate(specPath)
+	case FormatGraphQL:
+		result, err = v.graphqlValidator.Validate(specPath)
+	case FormatRAML:
+		result, err = v.ramlValidator.Validate(specPath)
+	case FormatBlueprint:
+		result, err = v.blueprintValidator.Validate(specPath)
+	default:
+		return fmt.Errorf("unsupported specification format")
 	}
 
-	// Create validator
-	validator := validate.NewSpecValidator(doc.Schema(), strfmt.Default)
-
-	// Validate the specification
-	result, _ := validator.Validate(doc)
-	if result != nil && result.HasErrors() {
-		return fmt.Errorf("specification validation failed: %v", result.Errors)
+	if err != nil {
+		return err
 	}
 
-	// Validate basic structure
-	v.logger.Debug("Validating basic structure")
-	if err := v.validateBasicStructure(doc); err != nil {
-		return fmt.Errorf("structure validation failed: %w", err)
-	}
-	v.logger.Debug("Basic structure validation passed")
-
-	// Validate security definitions
-	v.logger.Debug("Validating security definitions")
-	if err := v.validateSecurityDefinitions(doc); err != nil {
-		return fmt.Errorf("security validation failed: %w", err)
-	}
-	v.logger.Debug("Security definitions validation passed")
-
-	v.logger.WithFields(logrus.Fields{
-		"title":   doc.Spec().Info.Title,
-		"version": doc.Spec().Info.Version,
-		"paths":   len(doc.Spec().Paths.Paths),
-	}).Info("OpenAPI specification is valid")
+	// Log validation results
+	v.logValidationResult(result)
 
 	return nil
 }
 
-// validateBasicStructure checks the basic required fields of the OpenAPI spec
-func (v *Validator) validateBasicStructure(doc *loads.Document) error {
-	spec := doc.Spec()
-
-	if spec.Info == nil {
-		return fmt.Errorf("missing info section")
+// detectFormat determines the API specification format
+func (v *Validator) detectFormat(specPath string) (SpecFormat, error) {
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read spec file: %w", err)
 	}
 
-	if spec.Info.Title == "" {
-		return fmt.Errorf("missing API title")
+	content := string(data)
+
+	// Check file extension first
+	switch {
+	case strings.HasSuffix(specPath, ".graphql"):
+		return FormatGraphQL, nil
+	case strings.HasSuffix(specPath, ".apib"):
+		return FormatBlueprint, nil
 	}
 
-	if spec.Info.Version == "" {
-		return fmt.Errorf("missing API version")
+	// Check for RAML header
+	if strings.HasPrefix(strings.TrimSpace(content), "#%RAML") {
+		return FormatRAML, nil
 	}
 
-	if len(spec.Paths.Paths) == 0 {
-		return fmt.Errorf("no paths defined in the specification")
+	// Check for API Blueprint format header
+	if strings.HasPrefix(strings.TrimSpace(content), "FORMAT: 1A") {
+		return FormatBlueprint, nil
 	}
 
-	v.logger.WithFields(logrus.Fields{
-		"title":   spec.Info.Title,
-		"version": spec.Info.Version,
-		"paths":   len(spec.Paths.Paths),
-	}).Debug("Structure details")
+	// Try to parse as JSON/YAML
+	var spec struct {
+		Swagger  string `json:"swagger" yaml:"swagger"`
+		OpenAPI  string `json:"openapi" yaml:"openapi"`
+		AsyncAPI string `json:"asyncapi" yaml:"asyncapi"`
+	}
 
-	return nil
-}
-
-// validateSecurityDefinitions checks the security definitions in the spec
-func (v *Validator) validateSecurityDefinitions(doc *loads.Document) error {
-	spec := doc.Spec()
-
-	// Check if security schemes are properly defined
-	if spec.SecurityDefinitions != nil {
-		for name, scheme := range spec.SecurityDefinitions {
-			v.logger.WithFields(logrus.Fields{
-				"name": name,
-				"type": scheme.Type,
-			}).Debug("Validating security scheme")
-
-			if scheme.Type == "" {
-				return fmt.Errorf("security scheme %s missing type", name)
+	// Try JSON first
+	if err := json.Unmarshal(data, &spec); err != nil {
+		// If JSON fails, try YAML
+		if err := yaml.Unmarshal(data, &spec); err != nil {
+			// If both fail, check for GraphQL schema
+			if strings.Contains(content, "type Query") || strings.Contains(content, "schema {") {
+				return FormatGraphQL, nil
 			}
-
-			// Validate based on security type
-			switch scheme.Type {
-			case "oauth2":
-				if scheme.Flow == "" {
-					return fmt.Errorf("oauth2 security scheme %s missing flow", name)
-				}
-			case "apiKey":
-				if scheme.Name == "" || scheme.In == "" {
-					return fmt.Errorf("apiKey security scheme %s missing name or location", name)
-				}
-			}
+			return "", fmt.Errorf("failed to parse spec file")
 		}
 	}
 
-	return nil
+	switch {
+	case spec.Swagger == "2.0":
+		return FormatSwagger2, nil
+	case strings.HasPrefix(spec.OpenAPI, "3."):
+		return FormatOpenAPI3, nil
+	case spec.AsyncAPI != "":
+		return FormatAsyncAPI, nil
+	}
+
+	return "", fmt.Errorf("unable to determine specification format")
+}
+
+// logValidationResult logs the validation results
+func (v *Validator) logValidationResult(result *ValidationResult) {
+	if !result.Valid {
+		v.logger.Warn("Validation failed with errors:")
+		for _, err := range result.Errors {
+			v.logger.WithFields(logrus.Fields{
+				"path":       err.Path,
+				"severity":   err.Severity,
+				"suggestion": err.Suggestion,
+			}).Warn(err.Message)
+		}
+		return
+	}
+
+	v.logger.WithFields(logrus.Fields{
+		"title":   result.Info.Title,
+		"version": result.Info.Version,
+		"format":  result.Info.Format,
+		"paths":   len(result.Paths),
+		"methods": len(result.Methods),
+	}).Info("API specification is valid")
 }

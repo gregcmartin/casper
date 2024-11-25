@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/spec"
 	"github.com/sirupsen/logrus"
@@ -39,18 +40,30 @@ func (t *Tester) SetHeader(key, value string) {
 func (t *Tester) RunTests(specPath string) error {
 	t.logger.Info("Starting core security tests")
 
-	// Load the specification
+	// Detect spec version and validate accordingly
+	if strings.HasSuffix(specPath, ".yaml") || strings.HasSuffix(specPath, ".yml") {
+		// Try OpenAPI 3 first
+		if doc, err := openapi3.NewLoader().LoadFromFile(specPath); err == nil {
+			return t.runOpenAPI3Tests(doc)
+		}
+	}
+
+	// Fallback to Swagger 2.0
 	doc, err := loads.Spec(specPath)
 	if err != nil {
 		return fmt.Errorf("failed to load spec file: %w", err)
 	}
-	t.logger.Debug("Successfully loaded spec file")
+	return t.runSwagger2Tests(doc)
+}
 
+// runSwagger2Tests runs tests for Swagger 2.0 specs
+func (t *Tester) runSwagger2Tests(doc *loads.Document) error {
+	t.logger.Debug("Running Swagger 2.0 tests")
 	swagger := doc.Spec()
 
 	// Test each endpoint
 	for path, pathItem := range swagger.Paths.Paths {
-		if err := t.testPath(path, pathItem); err != nil {
+		if err := t.testSwagger2Path(path, pathItem); err != nil {
 			return fmt.Errorf("failed testing path %s: %w", path, err)
 		}
 	}
@@ -63,8 +76,29 @@ func (t *Tester) RunTests(specPath string) error {
 	return nil
 }
 
-// testPath runs security tests for a specific path
-func (t *Tester) testPath(path string, pathItem spec.PathItem) error {
+// runOpenAPI3Tests runs tests for OpenAPI 3.0 specs
+func (t *Tester) runOpenAPI3Tests(doc *openapi3.T) error {
+	t.logger.Debug("Running OpenAPI 3.0 tests")
+
+	// Test each endpoint
+	if doc.Paths != nil {
+		for path, pathItem := range doc.Paths.Map() {
+			if err := t.testOpenAPI3Path(path, pathItem); err != nil {
+				return fmt.Errorf("failed testing path %s: %w", path, err)
+			}
+		}
+	}
+
+	// Run global security tests
+	if err := t.testGlobalSecurity(); err != nil {
+		return fmt.Errorf("global security tests failed: %w", err)
+	}
+
+	return nil
+}
+
+// testSwagger2Path tests a Swagger 2.0 path
+func (t *Tester) testSwagger2Path(path string, pathItem spec.PathItem) error {
 	operations := map[string]*spec.Operation{
 		"GET":     pathItem.Get,
 		"POST":    pathItem.Post,
@@ -77,7 +111,34 @@ func (t *Tester) testPath(path string, pathItem spec.PathItem) error {
 
 	for method, op := range operations {
 		if op != nil {
-			if err := t.testOperation(method, path, op); err != nil {
+			if err := t.testOperation(method, path, op.Security != nil); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// testOpenAPI3Path tests an OpenAPI 3.0 path
+func (t *Tester) testOpenAPI3Path(path string, pathItem *openapi3.PathItem) error {
+	operations := map[string]*openapi3.Operation{
+		"GET":     pathItem.Get,
+		"POST":    pathItem.Post,
+		"PUT":     pathItem.Put,
+		"DELETE":  pathItem.Delete,
+		"PATCH":   pathItem.Patch,
+		"HEAD":    pathItem.Head,
+		"OPTIONS": pathItem.Options,
+	}
+
+	for method, op := range operations {
+		if op != nil {
+			requiresSecurity := false
+			if op.Security != nil {
+				requiresSecurity = len(*op.Security) > 0
+			}
+			if err := t.testOperation(method, path, requiresSecurity); err != nil {
 				return err
 			}
 		}
@@ -87,12 +148,12 @@ func (t *Tester) testPath(path string, pathItem spec.PathItem) error {
 }
 
 // testOperation runs security tests for a specific operation
-func (t *Tester) testOperation(method, path string, op *spec.Operation) error {
+func (t *Tester) testOperation(method, path string, requiresSecurity bool) error {
 	t.logger.Infof("Testing %s %s", method, path)
 
 	tests := []struct {
 		name string
-		fn   func(string, string, *spec.Operation) error
+		fn   func(string, string, bool) error
 	}{
 		{"Authentication", t.testAuthentication},
 		{"Authorization", t.testAuthorization},
@@ -104,28 +165,8 @@ func (t *Tester) testOperation(method, path string, op *spec.Operation) error {
 	}
 
 	for _, test := range tests {
-		if err := test.fn(method, path, op); err != nil {
+		if err := test.fn(method, path, requiresSecurity); err != nil {
 			t.logger.Warnf("%s test failed for %s %s: %v", test.name, method, path, err)
-		}
-	}
-
-	return nil
-}
-
-// testGlobalSecurity runs security tests that apply to the entire API
-func (t *Tester) testGlobalSecurity() error {
-	tests := []struct {
-		name string
-		fn   func() error
-	}{
-		{"TLS Configuration", t.testTLSConfig},
-		{"CORS Configuration", t.testCORSConfig},
-		{"Security Headers", t.testGlobalSecurityHeaders},
-	}
-
-	for _, test := range tests {
-		if err := test.fn(); err != nil {
-			t.logger.Warnf("%s test failed: %v", test.name, err)
 		}
 	}
 
@@ -134,9 +175,8 @@ func (t *Tester) testGlobalSecurity() error {
 
 // Test implementations
 
-func (t *Tester) testAuthentication(method, path string, op *spec.Operation) error {
-	// Test authentication mechanisms
-	if len(op.Security) > 0 {
+func (t *Tester) testAuthentication(method, path string, requiresSecurity bool) error {
+	if requiresSecurity {
 		resp, err := t.makeRequest(method, path, nil)
 		if err != nil {
 			return err
@@ -150,8 +190,7 @@ func (t *Tester) testAuthentication(method, path string, op *spec.Operation) err
 	return nil
 }
 
-func (t *Tester) testAuthorization(method, path string, op *spec.Operation) error {
-	// Test authorization levels
+func (t *Tester) testAuthorization(method, path string, requiresSecurity bool) error {
 	headers := map[string]string{
 		"Authorization": "Bearer invalid-token",
 	}
@@ -162,14 +201,13 @@ func (t *Tester) testAuthorization(method, path string, op *spec.Operation) erro
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusUnauthorized {
+	if requiresSecurity && resp.StatusCode != http.StatusUnauthorized {
 		t.logger.Warn("Endpoint accepts invalid authorization tokens")
 	}
 	return nil
 }
 
-func (t *Tester) testInputValidation(method, path string, op *spec.Operation) error {
-	// Test input validation
+func (t *Tester) testInputValidation(method, path string, requiresSecurity bool) error {
 	payloads := []string{
 		"<script>alert(1)</script>",
 		"'; DROP TABLE users--",
@@ -193,8 +231,7 @@ func (t *Tester) testInputValidation(method, path string, op *spec.Operation) er
 	return nil
 }
 
-func (t *Tester) testRateLimiting(method, path string, op *spec.Operation) error {
-	// Test rate limiting
+func (t *Tester) testRateLimiting(method, path string, requiresSecurity bool) error {
 	for i := 0; i < 20; i++ {
 		resp, err := t.makeRequest(method, path, nil)
 		if err != nil {
@@ -209,8 +246,7 @@ func (t *Tester) testRateLimiting(method, path string, op *spec.Operation) error
 	return nil
 }
 
-func (t *Tester) testErrorHandling(method, path string, op *spec.Operation) error {
-	// Test error handling
+func (t *Tester) testErrorHandling(method, path string, requiresSecurity bool) error {
 	headers := map[string]string{
 		"Content-Type": "invalid",
 	}
@@ -232,8 +268,7 @@ func (t *Tester) testErrorHandling(method, path string, op *spec.Operation) erro
 	return nil
 }
 
-func (t *Tester) testDataValidation(method, path string, op *spec.Operation) error {
-	// Test data validation
+func (t *Tester) testDataValidation(method, path string, requiresSecurity bool) error {
 	if method == "POST" || method == "PUT" {
 		invalidData := `{"invalid": true}`
 		headers := map[string]string{
@@ -253,8 +288,7 @@ func (t *Tester) testDataValidation(method, path string, op *spec.Operation) err
 	return nil
 }
 
-func (t *Tester) testSecurityHeaders(method, path string, op *spec.Operation) error {
-	// Test security headers
+func (t *Tester) testSecurityHeaders(method, path string, requiresSecurity bool) error {
 	resp, err := t.makeRequest(method, path, nil)
 	if err != nil {
 		return err
@@ -275,7 +309,7 @@ func (t *Tester) testSecurityHeaders(method, path string, op *spec.Operation) er
 	return nil
 }
 
-func (t *Tester) testTLSConfig() error {
+func (t *Tester) testGlobalSecurity() error {
 	// Test TLS configuration
 	if !strings.HasPrefix(t.baseURL, "https://") {
 		t.logger.Warn("API not using HTTPS")
@@ -290,16 +324,13 @@ func (t *Tester) testTLSConfig() error {
 	if resp.TLS != nil && resp.TLS.Version < tls.VersionTLS12 {
 		t.logger.Warn("TLS version below 1.2")
 	}
-	return nil
-}
 
-func (t *Tester) testCORSConfig() error {
 	// Test CORS configuration
 	headers := map[string]string{
 		"Origin": "http://evil.com",
 	}
 
-	resp, err := t.makeRequest("OPTIONS", "", headers)
+	resp, err = t.makeRequest("OPTIONS", "", headers)
 	if err != nil {
 		return err
 	}
@@ -308,20 +339,12 @@ func (t *Tester) testCORSConfig() error {
 	if resp.Header.Get("Access-Control-Allow-Origin") == "*" {
 		t.logger.Warn("CORS allows all origins")
 	}
-	return nil
-}
 
-func (t *Tester) testGlobalSecurityHeaders() error {
 	// Test global security headers
-	resp, err := t.makeRequest("GET", "", nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
 	if resp.Header.Get("Strict-Transport-Security") == "" {
 		t.logger.Warn("HSTS not implemented")
 	}
+
 	return nil
 }
 

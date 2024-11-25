@@ -1,0 +1,181 @@
+#%RAML 1.0
+title: Music Streaming API
+version: v1
+baseUri: https://api.musicservice.com/{version}
+mediaType: application/json
+securitySchemes:
+  oauth_2_0:
+    type: OAuth 2.0
+    settings:
+      accessTokenUri: https://api.musicservice.com/oauth/token
+      authorizationUri: https://api.musicservice.com/oauth/auth
+      authorizationGrants: [ authorization_code, client_credentials ]
+      scopes:
+        - playlist:read
+        - playlist:write
+        - user:read
+        - user:write
+
+types:
+  Song:
+    type: object
+    properties:
+      id: string
+      title: string
+      artist: string
+      album: string
+      duration: number
+      genre: string
+      releaseDate: date-only
+      url: string
+    example:
+      id: "song123"
+      title: "Example Song"
+      artist: "Example Artist"
+      album: "Example Album"
+      duration: 180
+      genre: "Rock"
+      releaseDate: "2024-01-01"
+      url: "https://stream.musicservice.com/song123"
+
+  Playlist:
+    type: object
+    properties:
+      id: string
+      name: string
+      description?: string
+      userId: string
+      songs: Song[]
+      createdAt: datetime
+      updatedAt: datetime
+
+  User:
+    type: object
+    properties:
+      id: string
+      username: string
+      email: string
+      premium: boolean
+      createdAt: datetime
+
+/songs:
+  get:
+    description: Get a list of songs
+    queryParameters:
+      genre?: string
+      artist?: string
+      album?: string
+    responses:
+      200:
+        body:
+          type: Song[]
+  /{songId}:
+    get:
+      description: Get a specific song
+      responses:
+        200:
+          body:
+            type: Song
+        404:
+          description: Song not found
+
+/playlists:
+  securedBy: [ oauth_2_0 ]
+  get:
+    description: Get user's playlists
+    responses:
+      200:
+        body:
+          type: Playlist[]
+  post:
+    description: Create a new playlist
+    body:
+      application/json:
+        type: object
+        properties:
+          name: string
+          description?: string
+    responses:
+      201:
+        body:
+          type: Playlist
+  /{playlistId}:
+    get:
+      description: Get a specific playlist
+      responses:
+        200:
+          body:
+            type: Playlist
+        404:
+          description: Playlist not found
+    put:
+      description: Update a playlist
+      body:
+        application/json:
+          type: object
+          properties:
+            name?: string
+            description?: string
+      responses:
+        200:
+          body:
+            type: Playlist
+    delete:
+      description: Delete a playlist
+      responses:
+        204:
+    /songs:
+      post:
+        description: Add a song to playlist
+        body:
+          application/json:
+            type: object
+            properties:
+              songId: string
+        responses:
+          201:
+            body:
+              type: Playlist
+      /{songId}:
+        delete:
+          description: Remove a song from playlist
+          responses:
+            204:
+
+/users:
+  securedBy: [ oauth_2_0 ]
+  get:
+    description: Get current user profile
+    responses:
+      200:
+        body:
+          type: User
+  put:
+    description: Update user profile
+    body:
+      application/json:
+        type: object
+        properties:
+          username?: string
+          email?: string
+    responses:
+      200:
+        body:
+          type: User
+
+/search:
+  get:
+    description: Search for songs, playlists, or users
+    queryParameters:
+      q: string
+      type:
+        type: string
+        enum: [song, playlist, user]
+    responses:
+      200:
+        body:
+          type: object
+          properties:
+            songs?: Song[]
+            playlists?: Playlist[]
+            users?: User[]

@@ -1,0 +1,115 @@
+asyncapi: '2.6.0'
+info:
+  title: Chat Service
+  version: 1.0.0
+  description: Real-time chat service API
+
+servers:
+  production:
+    url: wss://chat.example.com
+    protocol: wss
+    description: Production server
+  development:
+    url: ws://localhost:8080
+    protocol: ws
+    description: Development server
+
+channels:
+  user/signup:
+    publish:
+      summary: User signup event
+      message:
+        payload:
+          type: object
+          required:
+            - username
+            - email
+          properties:
+            username:
+              type: string
+              description: User's username
+            email:
+              type: string
+              format: email
+              description: User's email
+
+  chat/message:
+    publish:
+      summary: Send a chat message
+      message:
+        payload:
+          type: object
+          required:
+            - roomId
+            - message
+            - userId
+          properties:
+            roomId:
+              type: string
+              description: Chat room identifier
+            message:
+              type: string
+              description: Message content
+            userId:
+              type: string
+              description: Sender's user ID
+            timestamp:
+              type: string
+              format: date-time
+              description: Message timestamp
+    subscribe:
+      summary: Receive chat messages
+      message:
+        payload:
+          type: object
+          required:
+            - roomId
+            - message
+            - userId
+            - timestamp
+          properties:
+            roomId:
+              type: string
+              description: Chat room identifier
+            message:
+              type: string
+              description: Message content
+            userId:
+              type: string
+              description: Sender's user ID
+            timestamp:
+              type: string
+              format: date-time
+              description: Message timestamp
+
+  chat/typing:
+    publish:
+      summary: User typing indicator
+      message:
+        payload:
+          type: object
+          required:
+            - roomId
+            - userId
+            - isTyping
+          properties:
+            roomId:
+              type: string
+              description: Chat room identifier
+            userId:
+              type: string
+              description: User who is typing
+            isTyping:
+              type: boolean
+              description: Whether the user is typing
+
+components:
+  securitySchemes:
+    userJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token for user authentication
+
+security:
+  - userJWT: []
