@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gregcmartin/casper/internal/reporter"
 	"github.com/sirupsen/logrus"
 )
 
@@ -20,19 +21,18 @@ type Tester struct {
 	baseURL       string
 	headers       map[string]string
 	skipURLEncode bool
+	reporter      *reporter.Reporter
 }
 
 // New creates a new core security tester instance
-func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
-	// Ensure baseURL ends without a slash
-	baseURL = strings.TrimSuffix(baseURL, "/")
-
+func New(logger *logrus.Logger, client *http.Client, baseURL string, reporter *reporter.Reporter) *Tester {
 	return &Tester{
 		logger:        logger,
 		client:        client,
-		baseURL:       baseURL,
+		baseURL:       strings.TrimSuffix(baseURL, "/"),
 		headers:       make(map[string]string),
 		skipURLEncode: false,
+		reporter:      reporter,
 	}
 }
 
@@ -115,7 +115,13 @@ func (t *Tester) testAuthentication(ctx context.Context) error {
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusUnauthorized {
-			t.logger.Warn("Endpoint accessible without proper authentication:", endpoint)
+			t.reporter.LogIssue(
+				"Authentication Bypass",
+				"High",
+				"Endpoint accessible without proper authentication",
+				endpoint,
+				fmt.Sprintf("Status code: %d", resp.StatusCode),
+			)
 		}
 	}
 
@@ -141,7 +147,13 @@ func (t *Tester) testAuthorization(ctx context.Context) error {
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusUnauthorized {
-			t.logger.Warn("Endpoint accepts invalid authorization:", endpoint)
+			t.reporter.LogIssue(
+				"Authorization Bypass",
+				"High",
+				"Endpoint accepts invalid authorization token",
+				endpoint,
+				fmt.Sprintf("Status code: %d with invalid token", resp.StatusCode),
+			)
 		}
 	}
 
@@ -149,21 +161,43 @@ func (t *Tester) testAuthorization(ctx context.Context) error {
 }
 
 func (t *Tester) testInputValidation(ctx context.Context) error {
-	payloads := []string{
-		"<script>alert(1)</script>",
-		"'; DROP TABLE users--",
-		strings.Repeat("A", 10000),
+	payloads := []struct {
+		value       string
+		issueType   string
+		description string
+	}{
+		{
+			"<script>alert(1)</script>",
+			"XSS",
+			"Endpoint accepts XSS payload",
+		},
+		{
+			"'; DROP TABLE users--",
+			"SQL Injection",
+			"Endpoint accepts SQL injection payload",
+		},
+		{
+			strings.Repeat("A", 10000),
+			"Buffer Overflow",
+			"Endpoint accepts large input without validation",
+		},
 	}
 
 	for _, payload := range payloads {
-		resp, err := t.makeRequestWithBody(ctx, "POST", "/api/data", nil, payload)
+		resp, err := t.makeRequestWithBody(ctx, "POST", "/api/data", nil, payload.value)
 		if err != nil {
 			continue
 		}
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusBadRequest {
-			t.logger.Warnf("Endpoint accepts potentially malicious input: %s", payload)
+			t.reporter.LogIssue(
+				payload.issueType,
+				"High",
+				payload.description,
+				"/api/data",
+				fmt.Sprintf("Payload: %s, Status: %d", payload.value, resp.StatusCode),
+			)
 		}
 	}
 
@@ -172,15 +206,25 @@ func (t *Tester) testInputValidation(ctx context.Context) error {
 
 func (t *Tester) testRateLimiting(ctx context.Context) error {
 	endpoint := "/api/test"
+	requests := 0
+	start := time.Now()
+
 	for i := 0; i < 50; i++ {
 		resp, err := t.makeRequest(ctx, "GET", endpoint, nil, nil)
 		if err != nil {
 			continue
 		}
 		resp.Body.Close()
+		requests++
 
 		if i > 30 && resp.StatusCode != http.StatusTooManyRequests {
-			t.logger.Warn("No rate limiting detected")
+			t.reporter.LogIssue(
+				"Rate Limiting",
+				"Medium",
+				"No rate limiting detected on endpoint",
+				endpoint,
+				fmt.Sprintf("%d requests in %v without rate limiting", requests, time.Since(start)),
+			)
 			break
 		}
 	}
@@ -203,7 +247,13 @@ func (t *Tester) testErrorHandling(ctx context.Context) error {
 		resp.Body.Close()
 
 		if resp.StatusCode >= 500 {
-			t.logger.Warn("Server error detected:", endpoint)
+			t.reporter.LogIssue(
+				"Error Handling",
+				"Medium",
+				"Server error detected",
+				endpoint,
+				fmt.Sprintf("Status code: %d", resp.StatusCode),
+			)
 		}
 	}
 
@@ -227,7 +277,13 @@ func (t *Tester) testSecurityHeaders(ctx context.Context) error {
 
 	for _, header := range requiredHeaders {
 		if resp.Header.Get(header) == "" {
-			t.logger.Warnf("Missing security header: %s", header)
+			t.reporter.LogIssue(
+				"Missing Security Headers",
+				"Medium",
+				fmt.Sprintf("Missing security header: %s", header),
+				"/",
+				"Header not present in response",
+			)
 		}
 	}
 
@@ -236,7 +292,13 @@ func (t *Tester) testSecurityHeaders(ctx context.Context) error {
 
 func (t *Tester) testTLSConfig(ctx context.Context) error {
 	if !strings.HasPrefix(t.baseURL, "https://") {
-		t.logger.Warn("API not using HTTPS")
+		t.reporter.LogIssue(
+			"TLS Configuration",
+			"High",
+			"API not using HTTPS",
+			t.baseURL,
+			"Non-HTTPS URL in use",
+		)
 		return nil
 	}
 
@@ -248,7 +310,13 @@ func (t *Tester) testTLSConfig(ctx context.Context) error {
 
 	if resp.TLS != nil {
 		if resp.TLS.Version < tls.VersionTLS12 {
-			t.logger.Warn("TLS version below 1.2")
+			t.reporter.LogIssue(
+				"TLS Configuration",
+				"High",
+				"TLS version below 1.2",
+				t.baseURL,
+				fmt.Sprintf("TLS Version: %x", resp.TLS.Version),
+			)
 		}
 	}
 
@@ -302,11 +370,7 @@ func (t *Tester) makeRequest(ctx context.Context, method, endpoint string, heade
 	if params != nil {
 		q := u.Query()
 		for k, v := range params {
-			if !t.skipURLEncode {
-				q.Set(k, v)
-			} else {
-				q.Set(k, url.QueryEscape(v))
-			}
+			q.Set(k, v)
 		}
 		u.RawQuery = q.Encode()
 	}

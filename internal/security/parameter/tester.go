@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
 	return &Tester{
 		logger:        logger,
 		client:        client,
-		baseURL:       baseURL,
+		baseURL:       strings.TrimSuffix(baseURL, "/"),
 		headers:       make(map[string]string),
 		skipURLEncode: false,
 	}
@@ -82,36 +83,49 @@ func (t *Tester) runParameterTests() error {
 // Test implementations
 
 func (t *Tester) testParameterPollution(ctx context.Context) error {
-	tests := []struct {
-		endpoint string
-		params   map[string][]string
-	}{
-		{
-			endpoint: "/api/search",
-			params: map[string][]string{
-				"q":    {"test", "test2"},
-				"sort": {"asc", "desc"},
-			},
-		},
-		{
-			endpoint: "/api/filter",
-			params: map[string][]string{
-				"type":   {"user", "admin"},
-				"status": {"active", "inactive"},
-			},
-		},
+	endpoints := []string{
+		"/users/v1/login",
+		"/users/v1/register",
+		"/books/v1",
+		"/users/v1/{username}/email",
 	}
 
-	for _, test := range tests {
-		for param, values := range test.params {
-			resp, err := t.makeRequestWithParams(ctx, "GET", test.endpoint, param, values)
+	for _, endpoint := range endpoints {
+		// Test duplicate parameters
+		params := map[string][]string{
+			"username": {"user1", "admin"},
+			"email":    {"user@test.com", "admin@test.com"},
+			"id":       {"1", "2"},
+		}
+
+		for param, values := range params {
+			resp, err := t.makeRequestWithParams(ctx, "GET", endpoint, param, values)
 			if err != nil {
 				continue
 			}
 			resp.Body.Close()
 
 			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Potential HPP vulnerability found at %s with parameter %s", test.endpoint, param)
+				t.logger.Warnf("Potential HPP vulnerability: %s accepts duplicate parameters", endpoint)
+			}
+		}
+
+		// Test parameter splitting
+		splitParams := []string{
+			"username=user1,admin",
+			"email=user@test.com;admin@test.com",
+			"id=1|2",
+		}
+
+		for _, param := range splitParams {
+			resp, err := t.makeRequest(ctx, "GET", endpoint+"?"+param, nil, nil)
+			if err != nil {
+				continue
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				t.logger.Warnf("Potential parameter splitting vulnerability: %s accepts split parameters", endpoint)
 			}
 		}
 	}
@@ -120,33 +134,63 @@ func (t *Tester) testParameterPollution(ctx context.Context) error {
 }
 
 func (t *Tester) testTypeConfusion(ctx context.Context) error {
+	endpoints := []string{
+		"/users/v1/{username}",
+		"/books/v1/{book_title}",
+		"/users/v1/{username}/email",
+	}
+
 	tests := []struct {
-		endpoint string
-		param    string
-		values   []string
+		param string
+		tests []struct {
+			value    string
+			dataType string
+		}
 	}{
 		{
-			endpoint: "/api/user",
-			param:    "id",
-			values:   []string{"123", "\"123\"", "[123]", "{\"id\":123}"},
+			param: "id",
+			tests: []struct {
+				value    string
+				dataType string
+			}{
+				{"123", "number"},
+				{"\"123\"", "string"},
+				{"[123]", "array"},
+				{"{\"id\":123}", "object"},
+				{"true", "boolean"},
+				{"null", "null"},
+				{"undefined", "undefined"},
+				{"NaN", "NaN"},
+				{"Infinity", "Infinity"},
+			},
 		},
 		{
-			endpoint: "/api/item",
-			param:    "quantity",
-			values:   []string{"10", "\"10\"", "10.0", "true"},
+			param: "email",
+			tests: []struct {
+				value    string
+				dataType string
+			}{
+				{"test@test.com", "string"},
+				{"[\"test@test.com\"]", "array"},
+				{"{\"email\":\"test@test.com\"}", "object"},
+				{"123", "number"},
+				{"true", "boolean"},
+			},
 		},
 	}
 
-	for _, test := range tests {
-		for _, value := range test.values {
-			resp, err := t.makeRequestWithParam(ctx, "GET", test.endpoint, test.param, value)
-			if err != nil {
-				continue
-			}
-			resp.Body.Close()
+	for _, endpoint := range endpoints {
+		for _, test := range tests {
+			for _, typeTest := range test.tests {
+				resp, err := t.makeRequestWithParam(ctx, "GET", endpoint, test.param, typeTest.value)
+				if err != nil {
+					continue
+				}
+				resp.Body.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Potential type confusion at %s with value %s", test.endpoint, value)
+				if resp.StatusCode == http.StatusOK {
+					t.logger.Warnf("Potential type confusion: %s accepts %s as %s", endpoint, test.param, typeTest.dataType)
+				}
 			}
 		}
 	}
@@ -155,33 +199,54 @@ func (t *Tester) testTypeConfusion(ctx context.Context) error {
 }
 
 func (t *Tester) testArrayManipulation(ctx context.Context) error {
+	endpoints := []string{
+		"/books/v1",
+		"/users/v1",
+	}
+
 	tests := []struct {
-		endpoint string
-		param    string
-		arrays   []string
+		param  string
+		arrays []string
 	}{
 		{
-			endpoint: "/api/items",
-			param:    "ids",
-			arrays:   []string{"[1,2,3]", "[1;2;3]", "1,2,3", "{\"ids\":[1,2,3]}"},
+			param: "ids",
+			arrays: []string{
+				"[1,2,3]",
+				"[1;2;3]",
+				"1,2,3",
+				"{\"ids\":[1,2,3]}",
+				"[[1],[2],[3]]",
+				"[1][2][3]",
+				"1;2;3",
+				"1|2|3",
+			},
 		},
 		{
-			endpoint: "/api/batch",
-			param:    "users",
-			arrays:   []string{"[\"user1\",\"user2\"]", "user1,user2", "{\"users\":[\"user1\"]}"},
+			param: "usernames",
+			arrays: []string{
+				"[\"user1\",\"user2\"]",
+				"user1,user2",
+				"{\"users\":[\"user1\"]}",
+				"[[\"user1\"],[\"user2\"]]",
+				"[\"user1\"][\"user2\"]",
+				"user1;user2",
+				"user1|user2",
+			},
 		},
 	}
 
-	for _, test := range tests {
-		for _, array := range test.arrays {
-			resp, err := t.makeRequestWithParam(ctx, "GET", test.endpoint, test.param, array)
-			if err != nil {
-				continue
-			}
-			resp.Body.Close()
+	for _, endpoint := range endpoints {
+		for _, test := range tests {
+			for _, array := range test.arrays {
+				resp, err := t.makeRequestWithParam(ctx, "GET", endpoint, test.param, array)
+				if err != nil {
+					continue
+				}
+				resp.Body.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Potential array manipulation at %s with value %s", test.endpoint, array)
+				if resp.StatusCode == http.StatusOK {
+					t.logger.Warnf("Potential array manipulation: %s accepts %s with value %s", endpoint, test.param, array)
+				}
 			}
 		}
 	}
@@ -190,33 +255,43 @@ func (t *Tester) testArrayManipulation(ctx context.Context) error {
 }
 
 func (t *Tester) testObjectInjection(ctx context.Context) error {
+	endpoints := []string{
+		"/users/v1/register",
+		"/books/v1",
+		"/users/v1/{username}/email",
+	}
+
 	tests := []struct {
-		endpoint string
-		param    string
-		objects  []string
+		param   string
+		objects []string
 	}{
 		{
-			endpoint: "/api/update",
-			param:    "data",
+			param: "data",
 			objects: []string{
 				"{\"id\":1}",
 				"{\"id\":1,\"admin\":true}",
 				"{\"$where\":\"1=1\"}",
 				"{\"__proto__\":{\"admin\":true}}",
+				"{\"constructor\":{\"prototype\":{\"admin\":true}}}",
+				"{\"toString\":\"[object Object]\"}",
+				"{\"valueOf\":\"[object Object]\"}",
+				"{\"hasOwnProperty\":true}",
 			},
 		},
 	}
 
-	for _, test := range tests {
-		for _, obj := range test.objects {
-			resp, err := t.makeRequestWithParam(ctx, "POST", test.endpoint, test.param, obj)
-			if err != nil {
-				continue
-			}
-			resp.Body.Close()
+	for _, endpoint := range endpoints {
+		for _, test := range tests {
+			for _, obj := range test.objects {
+				resp, err := t.makeRequestWithParam(ctx, "POST", endpoint, test.param, obj)
+				if err != nil {
+					continue
+				}
+				resp.Body.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Potential object injection at %s with value %s", test.endpoint, obj)
+				if resp.StatusCode == http.StatusOK {
+					t.logger.Warnf("Potential object injection: %s accepts %s with value %s", endpoint, test.param, obj)
+				}
 			}
 		}
 	}
@@ -225,32 +300,56 @@ func (t *Tester) testObjectInjection(ctx context.Context) error {
 }
 
 func (t *Tester) testParameterTraversal(ctx context.Context) error {
+	endpoints := []string{
+		"/books/v1",
+		"/users/v1",
+	}
+
 	tests := []struct {
-		endpoint string
-		param    string
-		paths    []string
+		param string
+		paths []string
 	}{
 		{
-			endpoint: "/api/file",
-			param:    "path",
+			param: "path",
 			paths: []string{
 				"../../../etc/passwd",
 				"..\\..\\..\\windows\\win.ini",
 				"%2e%2e%2f%2e%2e%2f",
+				"....//....//",
+				"..;/..;/",
+				"..%252f..%252f",
+				"..%c0%af..%c0%af",
+				"..%u2215..%u2215",
+				"..%c1%9c..%c1%9c",
+			},
+		},
+		{
+			param: "file",
+			paths: []string{
+				"/etc/passwd",
+				"C:\\Windows\\win.ini",
+				"file:///etc/passwd",
+				"file://C:/Windows/win.ini",
+				"php://filter/convert.base64-encode/resource=index.php",
+				"data:text/plain;base64,SGVsbG8sIFdvcmxkIQ==",
+				"expect://id",
+				"phar://test.phar/test.txt",
 			},
 		},
 	}
 
-	for _, test := range tests {
-		for _, path := range test.paths {
-			resp, err := t.makeRequestWithParam(ctx, "GET", test.endpoint, test.param, path)
-			if err != nil {
-				continue
-			}
-			resp.Body.Close()
+	for _, endpoint := range endpoints {
+		for _, test := range tests {
+			for _, path := range test.paths {
+				resp, err := t.makeRequestWithParam(ctx, "GET", endpoint, test.param, path)
+				if err != nil {
+					continue
+				}
+				resp.Body.Close()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Potential parameter traversal at %s with value %s", test.endpoint, path)
+				if resp.StatusCode == http.StatusOK {
+					t.logger.Warnf("Potential parameter traversal: %s accepts %s with value %s", endpoint, test.param, path)
+				}
 			}
 		}
 	}
@@ -260,15 +359,32 @@ func (t *Tester) testParameterTraversal(ctx context.Context) error {
 
 // Helper methods
 
-func (t *Tester) makeRequestWithParam(ctx context.Context, method, path, param, value string) (*http.Response, error) {
-	urlPath := path
-	if !t.skipURLEncode {
-		urlPath = url.QueryEscape(path)
-		value = url.QueryEscape(value)
+func (t *Tester) makeRequest(ctx context.Context, method, endpoint string, headers map[string]string, params map[string]string) (*http.Response, error) {
+	// Build URL
+	u, err := url.Parse(t.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
-	fullURL := fmt.Sprintf("%s%s?%s=%s", t.baseURL, urlPath, param, value)
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, nil)
+	// Ensure endpoint starts with /
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+
+	// Set path
+	u.Path = path.Join(u.Path, endpoint)
+
+	// Add query parameters if any
+	if params != nil {
+		q := u.Query()
+		for k, v := range params {
+			q.Set(k, v)
+		}
+		u.RawQuery = q.Encode()
+	}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -278,6 +394,12 @@ func (t *Tester) makeRequestWithParam(ctx context.Context, method, path, param, 
 		req.Header.Set(k, v)
 	}
 
+	// Add additional headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// Make request
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -286,22 +408,35 @@ func (t *Tester) makeRequestWithParam(ctx context.Context, method, path, param, 
 	return resp, nil
 }
 
-func (t *Tester) makeRequestWithParams(ctx context.Context, method, path, param string, values []string) (*http.Response, error) {
-	urlPath := path
-	if !t.skipURLEncode {
-		urlPath = url.QueryEscape(path)
+func (t *Tester) makeRequestWithParam(ctx context.Context, method, endpoint, param, value string) (*http.Response, error) {
+	params := map[string]string{param: value}
+	return t.makeRequest(ctx, method, endpoint, nil, params)
+}
+
+func (t *Tester) makeRequestWithParams(ctx context.Context, method, endpoint, param string, values []string) (*http.Response, error) {
+	// Build URL
+	u, err := url.Parse(t.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
-	var params []string
+	// Ensure endpoint starts with /
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+
+	// Set path
+	u.Path = path.Join(u.Path, endpoint)
+
+	// Add query parameters
+	q := u.Query()
 	for _, value := range values {
-		if !t.skipURLEncode {
-			value = url.QueryEscape(value)
-		}
-		params = append(params, fmt.Sprintf("%s=%s", param, value))
+		q.Add(param, value) // Use Add instead of Set to allow multiple values
 	}
+	u.RawQuery = q.Encode()
 
-	fullURL := fmt.Sprintf("%s%s?%s", t.baseURL, urlPath, strings.Join(params, "&"))
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, nil)
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -311,6 +446,7 @@ func (t *Tester) makeRequestWithParams(ctx context.Context, method, path, param 
 		req.Header.Set(k, v)
 	}
 
+	// Make request
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)

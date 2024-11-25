@@ -2,192 +2,131 @@ package reporter
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
-// Severity represents the severity level of an issue
-type Severity string
-
-const (
-	Critical Severity = "CRITICAL"
-	High     Severity = "HIGH"
-	Medium   Severity = "MEDIUM"
-	Low      Severity = "LOW"
-	Info     Severity = "INFO"
-)
-
-// Category represents the type of test that found the issue
-type Category string
-
-const (
-	SecurityTest Category = "SECURITY"
-	BusinessTest Category = "BUSINESS_LOGIC"
-)
-
-// SubCategory provides more specific categorization of issues
-type SubCategory string
-
-const (
-	// Security subcategories
-	Authentication SubCategory = "AUTHENTICATION"
-	Authorization  SubCategory = "AUTHORIZATION"
-	Injection      SubCategory = "INJECTION"
-	XSS            SubCategory = "XSS"
-	CSRF           SubCategory = "CSRF"
-	CORS           SubCategory = "CORS"
-	InfoDisclosure SubCategory = "INFORMATION_DISCLOSURE"
-	RateLimit      SubCategory = "RATE_LIMITING"
-	SSRF           SubCategory = "SSRF"
-	JWT            SubCategory = "JWT_SECURITY"
-	MassAssignment SubCategory = "MASS_ASSIGNMENT"
-
-	// Business logic subcategories
-	ResourceDependency SubCategory = "RESOURCE_DEPENDENCY"
-	StateTransition    SubCategory = "STATE_TRANSITION"
-	DataConsistency    SubCategory = "DATA_CONSISTENCY"
-	AccessControl      SubCategory = "ACCESS_CONTROL"
-)
-
-// Issue represents a security or business logic issue found during testing
-type Issue struct {
-	ID          string      `json:"id"`
-	Title       string      `json:"title"`
-	Description string      `json:"description"`
-	Category    Category    `json:"category"`
-	SubCategory SubCategory `json:"sub_category"`
-	Severity    Severity    `json:"severity"`
-	Path        string      `json:"path"`
-	Method      string      `json:"method"`
-	Evidence    string      `json:"evidence,omitempty"`
-	Mitigation  string      `json:"mitigation,omitempty"`
-	References  []string    `json:"references,omitempty"`
-	Timestamp   time.Time   `json:"timestamp"`
-}
-
-// Report represents a complete test report
-type Report struct {
-	Summary struct {
-		TotalIssues      int                       `json:"total_issues"`
-		IssuesBySeverity map[Severity]int          `json:"issues_by_severity"`
-		IssuesByCategory map[Category]int          `json:"issues_by_category"`
-		StartTime        time.Time                 `json:"start_time"`
-		EndTime          time.Time                 `json:"end_time"`
-		TestCoverage     map[SubCategory]TestStats `json:"test_coverage"`
-	} `json:"summary"`
-	Issues []Issue `json:"issues"`
-}
-
-// TestStats represents statistics for a specific test category
-type TestStats struct {
-	TestsRun    int `json:"tests_run"`
-	TestsPassed int `json:"tests_passed"`
-	TestsFailed int `json:"tests_failed"`
-}
-
-// Reporter handles the generation of test reports
+// Reporter handles test result reporting
 type Reporter struct {
 	logger *logrus.Logger
-	report Report
+	issues []Issue
 }
 
-// New creates a new Reporter instance
+// Issue represents a security issue found during testing
+type Issue struct {
+	Type        string    `json:"type"`
+	Severity    string    `json:"severity"`
+	Description string    `json:"description"`
+	Endpoint    string    `json:"endpoint,omitempty"`
+	Evidence    string    `json:"evidence,omitempty"`
+	Timestamp   time.Time `json:"timestamp"`
+}
+
+// New creates a new reporter instance
 func New(logger *logrus.Logger) *Reporter {
-	r := &Reporter{
+	return &Reporter{
 		logger: logger,
-		report: Report{},
+		issues: make([]Issue, 0),
 	}
-	r.report.Summary.IssuesBySeverity = make(map[Severity]int)
-	r.report.Summary.IssuesByCategory = make(map[Category]int)
-	r.report.Summary.TestCoverage = make(map[SubCategory]TestStats)
-	r.report.Summary.StartTime = time.Now()
-	return r
 }
 
-// AddIssue adds a new issue to the report
-func (r *Reporter) AddIssue(issue Issue) {
-	r.report.Issues = append(r.report.Issues, issue)
-	r.report.Summary.TotalIssues++
-	r.report.Summary.IssuesBySeverity[issue.Severity]++
-	r.report.Summary.IssuesByCategory[issue.Category]++
-}
-
-// UpdateTestStats updates the test statistics for a subcategory
-func (r *Reporter) UpdateTestStats(subCategory SubCategory, passed bool) {
-	stats := r.report.Summary.TestCoverage[subCategory]
-	stats.TestsRun++
-	if passed {
-		stats.TestsPassed++
-	} else {
-		stats.TestsFailed++
+// AddIssue adds a security issue to the report
+func (r *Reporter) AddIssue(issueType, severity, description string, endpoint, evidence string) {
+	issue := Issue{
+		Type:        issueType,
+		Severity:    severity,
+		Description: description,
+		Endpoint:    endpoint,
+		Evidence:    evidence,
+		Timestamp:   time.Now(),
 	}
-	r.report.Summary.TestCoverage[subCategory] = stats
+	r.issues = append(r.issues, issue)
 }
 
-// GenerateReport finalizes and saves the report to a file
+// GenerateReport creates the final security report
 func (r *Reporter) GenerateReport(outputPath string) error {
-	r.report.Summary.EndTime = time.Now()
-
-	// Calculate test coverage percentages
-	for subCategory, stats := range r.report.Summary.TestCoverage {
-		r.logger.WithFields(logrus.Fields{
-			"subCategory": subCategory,
-			"passed":      stats.TestsPassed,
-			"failed":      stats.TestsFailed,
-			"total":       stats.TestsRun,
-		}).Debug("Test coverage stats")
+	// Clean up the output path
+	outputPath = filepath.Clean(outputPath)
+	if filepath.Ext(outputPath) == "" {
+		outputPath += ".json"
 	}
 
-	// Create the report file
+	// Create report structure
+	report := struct {
+		Summary struct {
+			TotalIssues      int            `json:"total_issues"`
+			IssuesBySeverity map[string]int `json:"issues_by_severity"`
+			IssuesByType     map[string]int `json:"issues_by_type"`
+			Duration         string         `json:"duration"`
+			Timestamp        time.Time      `json:"timestamp"`
+		} `json:"summary"`
+		Issues []Issue `json:"issues"`
+	}{
+		Issues: r.issues,
+	}
+
+	// Calculate summary statistics
+	report.Summary.TotalIssues = len(r.issues)
+	report.Summary.IssuesBySeverity = make(map[string]int)
+	report.Summary.IssuesByType = make(map[string]int)
+	report.Summary.Timestamp = time.Now()
+
+	for _, issue := range r.issues {
+		report.Summary.IssuesBySeverity[issue.Severity]++
+		report.Summary.IssuesByType[issue.Type]++
+	}
+
+	// Create output file
 	file, err := os.Create(outputPath)
 	if err != nil {
-		return fmt.Errorf("failed to create report file: %w", err)
+		return err
 	}
 	defer file.Close()
 
-	// Write report as JSON
+	// Write report
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(r.report); err != nil {
-		return fmt.Errorf("failed to encode report: %w", err)
+	if err := encoder.Encode(report); err != nil {
+		return err
 	}
 
-	r.logger.Infof("Report generated successfully: %s", outputPath)
-	r.logSummary()
+	// Log summary
+	r.logger.Info("Report generated successfully:", outputPath)
+	r.logger.Info("=== Test Summary ===")
+	r.logger.Infof("Total Issues: %d", report.Summary.TotalIssues)
+	r.logger.Info("Issues by Severity:")
+	for severity, count := range report.Summary.IssuesBySeverity {
+		r.logger.Infof("  %s: %d", severity, count)
+	}
+	r.logger.Info("Issues by Type:")
+	for issueType, count := range report.Summary.IssuesByType {
+		r.logger.Infof("  %s: %d", issueType, count)
+	}
 
 	return nil
 }
 
-// logSummary prints a summary of the findings
-func (r *Reporter) logSummary() {
-	r.logger.Info("=== Test Summary ===")
-	r.logger.Infof("Total Issues: %d", r.report.Summary.TotalIssues)
-
-	r.logger.Info("Issues by Severity:")
-	for severity, count := range r.report.Summary.IssuesBySeverity {
-		r.logger.Infof("  %s: %d", severity, count)
+// LogIssue logs an issue and adds it to the report
+func (r *Reporter) LogIssue(issueType, severity, description string, endpoint, evidence string) {
+	r.logger.Warnf("[%s] %s: %s", severity, issueType, description)
+	if endpoint != "" {
+		r.logger.Warnf("Endpoint: %s", endpoint)
 	}
-
-	r.logger.Info("Issues by Category:")
-	for category, count := range r.report.Summary.IssuesByCategory {
-		r.logger.Infof("  %s: %d", category, count)
+	if evidence != "" {
+		r.logger.Warnf("Evidence: %s", evidence)
 	}
-
-	r.logger.Info("Test Coverage:")
-	for subCategory, stats := range r.report.Summary.TestCoverage {
-		passRate := float64(stats.TestsPassed) / float64(stats.TestsRun) * 100
-		r.logger.Infof("  %s: %.1f%% (%d/%d passed)",
-			subCategory, passRate, stats.TestsPassed, stats.TestsRun)
-	}
-
-	duration := r.report.Summary.EndTime.Sub(r.report.Summary.StartTime)
-	r.logger.Infof("Duration: %v", duration)
+	r.AddIssue(issueType, severity, description, endpoint, evidence)
 }
 
-// GetReport returns the current report
-func (r *Reporter) GetReport() Report {
-	return r.report
+// GetIssueCount returns the total number of issues found
+func (r *Reporter) GetIssueCount() int {
+	return len(r.issues)
+}
+
+// Clear removes all issues from the reporter
+func (r *Reporter) Clear() {
+	r.issues = make([]Issue, 0)
 }

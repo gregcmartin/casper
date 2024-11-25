@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gregcmartin/casper/internal/reporter"
 	"github.com/gregcmartin/casper/internal/security/bola"
 	"github.com/gregcmartin/casper/internal/security/core"
 	"github.com/gregcmartin/casper/internal/security/export"
@@ -19,6 +20,7 @@ import (
 // Tester is the main security testing orchestrator
 type Tester struct {
 	logger        *logrus.Logger
+	reporter      *reporter.Reporter
 	coreTester    *core.Tester
 	paramTester   *parameter.Tester
 	graphqlTester *graphql.Tester
@@ -44,11 +46,13 @@ func New(logger *logrus.Logger, baseURL string) *Tester {
 	}
 
 	baseURL = strings.TrimRight(baseURL, "/")
+	reporter := reporter.New(logger)
 
 	return &Tester{
 		logger:        logger,
+		reporter:      reporter,
 		baseURL:       baseURL,
-		coreTester:    core.New(logger, client, baseURL),
+		coreTester:    core.New(logger, client, baseURL, reporter),
 		paramTester:   parameter.New(logger, client, baseURL),
 		graphqlTester: graphql.New(logger, client, baseURL),
 		staticTester:  static.New(logger, client, baseURL),
@@ -182,6 +186,11 @@ func (t *Tester) SetHeader(key, value string) {
 // SetUserToken sets a user token for BOLA testing
 func (t *Tester) SetUserToken(userID, token string) {
 	t.bolaTester.SetUserToken(userID, token)
+}
+
+// GetReporter returns the reporter instance
+func (t *Tester) GetReporter() *reporter.Reporter {
+	return t.reporter
 }
 
 // extractPaths extracts all paths from the OpenAPI spec

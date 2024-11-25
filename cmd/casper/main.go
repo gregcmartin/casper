@@ -13,7 +13,6 @@ import (
 
 	"github.com/gregcmartin/casper/internal/business"
 	"github.com/gregcmartin/casper/internal/crawler"
-	"github.com/gregcmartin/casper/internal/reporter"
 	"github.com/gregcmartin/casper/internal/security"
 	"github.com/gregcmartin/casper/internal/validator"
 	"github.com/sirupsen/logrus"
@@ -78,9 +77,6 @@ var testCmd = &cobra.Command{
 			logger.Error("Base URL is required for testing")
 			os.Exit(1)
 		}
-
-		// Initialize the reporter
-		r := reporter.New(logger)
 
 		// Initialize security tester
 		tester := security.New(logger, baseURL)
@@ -158,14 +154,19 @@ var testCmd = &cobra.Command{
 
 		// Generate report
 		if outputFile == "" {
-			outputFile = "casper-report.json"
 			if len(args) > 0 {
-				outputFile = fmt.Sprintf("casper-report-%s.json",
-					filepath.Base(args[0]))
+				baseName := filepath.Base(args[0])
+				ext := filepath.Ext(baseName)
+				name := strings.TrimSuffix(baseName, ext)
+				outputFile = fmt.Sprintf("casper-report-%s.json", name)
+			} else {
+				outputFile = "casper-report.json"
 			}
+		} else if !strings.HasSuffix(outputFile, ".json") {
+			outputFile += ".json"
 		}
 
-		if err := r.GenerateReport(outputFile); err != nil {
+		if err := tester.GetReporter().GenerateReport(outputFile); err != nil {
 			logger.Errorf("Failed to generate report: %v", err)
 			os.Exit(1)
 		}
