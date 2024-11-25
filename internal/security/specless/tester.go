@@ -1,12 +1,14 @@
 package specless
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -30,6 +32,9 @@ type TestResult struct {
 
 // New creates a new specless tester instance
 func New(logger *logrus.Logger, client *http.Client) *Tester {
+	// Set reasonable timeouts
+	client.Timeout = 10 * time.Second
+
 	return &Tester{
 		logger: logger,
 		client: client,
@@ -40,10 +45,14 @@ func New(logger *logrus.Logger, client *http.Client) *Tester {
 func (t *Tester) RunTests(endpoints []APIEndpoint) ([]TestResult, error) {
 	t.logger.Info("Starting specless security testing")
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
 	var (
 		results []TestResult
 		wg      sync.WaitGroup
 		mutex   sync.Mutex
+		errChan = make(chan error, len(endpoints))
 	)
 
 	for _, endpoint := range endpoints {
@@ -52,48 +61,135 @@ func (t *Tester) RunTests(endpoints []APIEndpoint) ([]TestResult, error) {
 			defer wg.Done()
 
 			// Validate endpoint is accessible before testing
-			if !t.isEndpointActive(ep) {
+			active, err := t.isEndpointActive(ctx, ep)
+			if err != nil {
+				if !strings.Contains(err.Error(), "no such host") {
+					select {
+					case errChan <- err:
+					default:
+					}
+				}
+				return
+			}
+			if !active {
 				t.logger.Debugf("Skipping inactive endpoint: %s", ep.URL)
 				return
 			}
 
 			// Run various security tests
-			endpointResults := []TestResult{}
+			var endpointResults []TestResult
 
-			// Only test endpoints that return valid responses
-			if authResults := t.runAuthTests(ep); len(authResults) > 0 {
-				endpointResults = append(endpointResults, authResults...)
-			}
-			if injResults := t.runInjectionTests(ep); len(injResults) > 0 {
-				endpointResults = append(endpointResults, injResults...)
-			}
-			if headerResults := t.runHeaderTests(ep); len(headerResults) > 0 {
-				endpointResults = append(endpointResults, headerResults...)
-			}
-			if methodResults := t.runMethodTests(ep); len(methodResults) > 0 {
-				endpointResults = append(endpointResults, methodResults...)
+			// Run tests in parallel
+			var testWg sync.WaitGroup
+			var testMutex sync.Mutex
+			testErrChan := make(chan error, 4) // 4 test types
+
+			testWg.Add(4)
+			go func() {
+				defer testWg.Done()
+				if results, err := t.runAuthTests(ctx, ep); err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						testErrChan <- err
+					}
+				} else if len(results) > 0 {
+					testMutex.Lock()
+					endpointResults = append(endpointResults, results...)
+					testMutex.Unlock()
+				}
+			}()
+
+			go func() {
+				defer testWg.Done()
+				if results, err := t.runInjectionTests(ctx, ep); err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						testErrChan <- err
+					}
+				} else if len(results) > 0 {
+					testMutex.Lock()
+					endpointResults = append(endpointResults, results...)
+					testMutex.Unlock()
+				}
+			}()
+
+			go func() {
+				defer testWg.Done()
+				if results, err := t.runHeaderTests(ctx, ep); err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						testErrChan <- err
+					}
+				} else if len(results) > 0 {
+					testMutex.Lock()
+					endpointResults = append(endpointResults, results...)
+					testMutex.Unlock()
+				}
+			}()
+
+			go func() {
+				defer testWg.Done()
+				if results, err := t.runMethodTests(ctx, ep); err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						testErrChan <- err
+					}
+				} else if len(results) > 0 {
+					testMutex.Lock()
+					endpointResults = append(endpointResults, results...)
+					testMutex.Unlock()
+				}
+			}()
+
+			testWg.Wait()
+			close(testErrChan)
+
+			// Collect test errors
+			for err := range testErrChan {
+				if err != nil && !strings.Contains(err.Error(), "no such host") {
+					select {
+					case errChan <- err:
+					default:
+					}
+				}
 			}
 
-			mutex.Lock()
-			results = append(results, endpointResults...)
-			mutex.Unlock()
+			// Add results to global results slice
+			if len(endpointResults) > 0 {
+				mutex.Lock()
+				results = append(results, endpointResults...)
+				mutex.Unlock()
+			}
 		}(endpoint)
 	}
 
 	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return results, fmt.Errorf("multiple test failures: %v", errs)
+	}
 	return results, nil
 }
 
 // isEndpointActive checks if an endpoint is actually active and responding
-func (t *Tester) isEndpointActive(endpoint APIEndpoint) bool {
-	req, err := http.NewRequest("GET", endpoint.URL, nil)
+func (t *Tester) isEndpointActive(ctx context.Context, endpoint APIEndpoint) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint.URL, nil)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return false
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return false, err
+		}
+		return false, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -101,22 +197,26 @@ func (t *Tester) isEndpointActive(endpoint APIEndpoint) bool {
 	return resp.StatusCode != http.StatusNotFound &&
 		resp.StatusCode != http.StatusGone &&
 		resp.StatusCode != http.StatusBadGateway &&
-		resp.StatusCode != http.StatusServiceUnavailable
+		resp.StatusCode != http.StatusServiceUnavailable, nil
 }
 
 // runAuthTests performs authentication-related security tests
-func (t *Tester) runAuthTests(endpoint APIEndpoint) []TestResult {
+func (t *Tester) runAuthTests(ctx context.Context, endpoint APIEndpoint) ([]TestResult, error) {
 	var results []TestResult
 
 	// Test missing authentication
-	req, err := http.NewRequest(endpoint.Method, endpoint.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, endpoint.Method, endpoint.URL, nil)
 	if err != nil {
-		return results
+		return nil, err
 	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return results
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -125,7 +225,7 @@ func (t *Tester) runAuthTests(endpoint APIEndpoint) []TestResult {
 		// Check response content for sensitive data
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return results
+			return nil, err
 		}
 
 		// Only report if sensitive data is found
@@ -144,16 +244,24 @@ func (t *Tester) runAuthTests(endpoint APIEndpoint) []TestResult {
 
 	// Test auth bypass only on endpoints that normally require auth
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		bypassResults := t.testAuthBypass(endpoint)
+		bypassResults, err := t.testAuthBypass(ctx, endpoint)
+		if err != nil {
+			return results, err
+		}
 		results = append(results, bypassResults...)
 	}
 
-	return results
+	return results, nil
 }
 
 // testAuthBypass tests various authentication bypass techniques
-func (t *Tester) testAuthBypass(endpoint APIEndpoint) []TestResult {
-	var results []TestResult
+func (t *Tester) testAuthBypass(ctx context.Context, endpoint APIEndpoint) ([]TestResult, error) {
+	var (
+		results []TestResult
+		wg      sync.WaitGroup
+		mutex   sync.Mutex
+		errChan = make(chan error, 4) // 4 bypass headers
+	)
 
 	bypassHeaders := map[string]string{
 		"X-Original-URL":     endpoint.URL,
@@ -163,41 +271,82 @@ func (t *Tester) testAuthBypass(endpoint APIEndpoint) []TestResult {
 	}
 
 	for header, value := range bypassHeaders {
-		req, err := http.NewRequest(endpoint.Method, endpoint.URL, nil)
-		if err != nil {
-			continue
-		}
+		wg.Add(1)
+		go func(h, v string) {
+			defer wg.Done()
 
-		req.Header.Set(header, value)
-		resp, err := t.client.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				req, err := http.NewRequestWithContext(ctx, endpoint.Method, endpoint.URL, nil)
+				if err != nil {
+					errChan <- err
+					return
+				}
 
-		// Only report bypass if we get a successful response
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-			body, _ := io.ReadAll(resp.Body)
-			if t.containsSensitiveData(string(body)) {
-				results = append(results, TestResult{
-					Endpoint:    endpoint.URL,
-					Method:      endpoint.Method,
-					TestName:    "Auth Bypass Check",
-					Description: fmt.Sprintf("Authentication bypass possible using %s header", header),
-					Severity:    "High",
-					Status:      "Failed",
-					Details:     fmt.Sprintf("Bypass successful with header %s: %s", header, value),
-				})
+				req.Header.Set(h, v)
+				resp, err := t.client.Do(req)
+				if err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						errChan <- err
+					}
+					return
+				}
+				defer resp.Body.Close()
+
+				// Only report bypass if we get a successful response
+				if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						errChan <- err
+						return
+					}
+
+					if t.containsSensitiveData(string(body)) {
+						mutex.Lock()
+						results = append(results, TestResult{
+							Endpoint:    endpoint.URL,
+							Method:      endpoint.Method,
+							TestName:    "Auth Bypass Check",
+							Description: fmt.Sprintf("Authentication bypass possible using %s header", h),
+							Severity:    "High",
+							Status:      "Failed",
+							Details:     fmt.Sprintf("Bypass successful with header %s: %s", h, v),
+						})
+						mutex.Unlock()
+					}
+				}
 			}
+		}(header, value)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
 		}
 	}
 
-	return results
+	if len(errs) > 0 {
+		return results, fmt.Errorf("multiple auth bypass test failures: %v", errs)
+	}
+	return results, nil
 }
 
 // runInjectionTests performs injection-related security tests
-func (t *Tester) runInjectionTests(endpoint APIEndpoint) []TestResult {
-	var results []TestResult
+func (t *Tester) runInjectionTests(ctx context.Context, endpoint APIEndpoint) ([]TestResult, error) {
+	var (
+		results []TestResult
+		wg      sync.WaitGroup
+		mutex   sync.Mutex
+		errChan = make(chan error, 10) // Approximate number of total payloads
+	)
 
 	payloads := map[string][]string{
 		"SQL Injection": {
@@ -219,81 +368,122 @@ func (t *Tester) runInjectionTests(endpoint APIEndpoint) []TestResult {
 
 	for testType, testPayloads := range payloads {
 		for _, payload := range testPayloads {
-			// Test in URL parameters
-			testURL := fmt.Sprintf("%s?param=%s", endpoint.URL, payload)
-			req, err := http.NewRequest(endpoint.Method, testURL, nil)
-			if err != nil {
-				continue
-			}
+			wg.Add(1)
+			go func(tt, p string) {
+				defer wg.Done()
 
-			resp, err := t.client.Do(req)
-			if err != nil {
-				continue
-			}
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					// Test in URL parameters
+					testURL := fmt.Sprintf("%s?param=%s", endpoint.URL, p)
+					req, err := http.NewRequestWithContext(ctx, endpoint.Method, testURL, nil)
+					if err != nil {
+						errChan <- err
+						return
+					}
 
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				continue
-			}
+					resp, err := t.client.Do(req)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
 
-			// Validate injection results based on type
-			switch testType {
-			case "SQL Injection":
-				if t.validateSQLInjection(string(body), payload) {
-					results = append(results, TestResult{
-						Endpoint:    endpoint.URL,
-						Method:      endpoint.Method,
-						TestName:    testType,
-						Description: "SQL Injection vulnerability confirmed",
-						Severity:    "High",
-						Status:      "Failed",
-						Details:     fmt.Sprintf("Payload: %s successfully executed", payload),
-					})
+					body, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if err != nil {
+						errChan <- err
+						return
+					}
+
+					// Validate injection results based on type
+					var result *TestResult
+					switch tt {
+					case "SQL Injection":
+						if t.validateSQLInjection(string(body), p) {
+							result = &TestResult{
+								Endpoint:    endpoint.URL,
+								Method:      endpoint.Method,
+								TestName:    tt,
+								Description: "SQL Injection vulnerability confirmed",
+								Severity:    "High",
+								Status:      "Failed",
+								Details:     fmt.Sprintf("Payload: %s successfully executed", p),
+							}
+						}
+					case "Command Injection":
+						if t.validateCommandInjection(string(body), p) {
+							result = &TestResult{
+								Endpoint:    endpoint.URL,
+								Method:      endpoint.Method,
+								TestName:    tt,
+								Description: "Command Injection vulnerability confirmed",
+								Severity:    "High",
+								Status:      "Failed",
+								Details:     fmt.Sprintf("Payload: %s successfully executed", p),
+							}
+						}
+					case "XSS":
+						if t.validateXSS(string(body), p) {
+							result = &TestResult{
+								Endpoint:    endpoint.URL,
+								Method:      endpoint.Method,
+								TestName:    tt,
+								Description: "XSS vulnerability confirmed",
+								Severity:    "High",
+								Status:      "Failed",
+								Details:     fmt.Sprintf("Payload: %s successfully reflected", p),
+							}
+						}
+					}
+
+					if result != nil {
+						mutex.Lock()
+						results = append(results, *result)
+						mutex.Unlock()
+					}
 				}
-			case "Command Injection":
-				if t.validateCommandInjection(string(body), payload) {
-					results = append(results, TestResult{
-						Endpoint:    endpoint.URL,
-						Method:      endpoint.Method,
-						TestName:    testType,
-						Description: "Command Injection vulnerability confirmed",
-						Severity:    "High",
-						Status:      "Failed",
-						Details:     fmt.Sprintf("Payload: %s successfully executed", payload),
-					})
-				}
-			case "XSS":
-				if t.validateXSS(string(body), payload) {
-					results = append(results, TestResult{
-						Endpoint:    endpoint.URL,
-						Method:      endpoint.Method,
-						TestName:    testType,
-						Description: "XSS vulnerability confirmed",
-						Severity:    "High",
-						Status:      "Failed",
-						Details:     fmt.Sprintf("Payload: %s successfully reflected", payload),
-					})
-				}
-			}
+			}(testType, payload)
 		}
 	}
 
-	return results
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return results, fmt.Errorf("multiple injection test failures: %v", errs)
+	}
+	return results, nil
 }
 
 // runHeaderTests performs security header tests
-func (t *Tester) runHeaderTests(endpoint APIEndpoint) []TestResult {
+func (t *Tester) runHeaderTests(ctx context.Context, endpoint APIEndpoint) ([]TestResult, error) {
 	var results []TestResult
 
-	req, err := http.NewRequest(endpoint.Method, endpoint.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, endpoint.Method, endpoint.URL, nil)
 	if err != nil {
-		return results
+		return nil, err
 	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return results
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -333,59 +523,100 @@ func (t *Tester) runHeaderTests(endpoint APIEndpoint) []TestResult {
 		}
 	}
 
-	return results
+	return results, nil
 }
 
 // runMethodTests checks for dangerous HTTP methods
-func (t *Tester) runMethodTests(endpoint APIEndpoint) []TestResult {
-	var results []TestResult
-
-	dangerousMethods := []string{"PUT", "DELETE", "TRACE", "OPTIONS"}
+func (t *Tester) runMethodTests(ctx context.Context, endpoint APIEndpoint) ([]TestResult, error) {
+	var (
+		results []TestResult
+		wg      sync.WaitGroup
+		mutex   sync.Mutex
+		errChan = make(chan error, 4) // 4 dangerous methods
+	)
 
 	// First check if endpoint is accessible with GET
-	req, err := http.NewRequest("GET", endpoint.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint.URL, nil)
 	if err != nil {
-		return results
+		return nil, err
 	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return results
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	resp.Body.Close()
 
 	// Only test methods if endpoint is active
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
+		dangerousMethods := []string{"PUT", "DELETE", "TRACE", "OPTIONS"}
+
 		for _, method := range dangerousMethods {
-			req, err := http.NewRequest(method, endpoint.URL, nil)
-			if err != nil {
-				continue
-			}
+			wg.Add(1)
+			go func(m string) {
+				defer wg.Done()
 
-			resp, err := t.client.Do(req)
-			if err != nil {
-				continue
-			}
-			resp.Body.Close()
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					req, err := http.NewRequestWithContext(ctx, m, endpoint.URL, nil)
+					if err != nil {
+						errChan <- err
+						return
+					}
 
-			// Only report if dangerous method is actually enabled and working
-			if resp.StatusCode == http.StatusOK ||
-				resp.StatusCode == http.StatusCreated ||
-				resp.StatusCode == http.StatusAccepted {
-				results = append(results, TestResult{
-					Endpoint:    endpoint.URL,
-					Method:      method,
-					TestName:    "Dangerous HTTP Methods",
-					Description: fmt.Sprintf("Dangerous HTTP method %s is enabled and functional", method),
-					Severity:    "Medium",
-					Status:      "Failed",
-					Details:     fmt.Sprintf("Method %s returned status code %d", method, resp.StatusCode),
-				})
+					resp, err := t.client.Do(req)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
+					resp.Body.Close()
+
+					// Only report if dangerous method is actually enabled and working
+					if resp.StatusCode == http.StatusOK ||
+						resp.StatusCode == http.StatusCreated ||
+						resp.StatusCode == http.StatusAccepted {
+						mutex.Lock()
+						results = append(results, TestResult{
+							Endpoint:    endpoint.URL,
+							Method:      m,
+							TestName:    "Dangerous HTTP Methods",
+							Description: fmt.Sprintf("Dangerous HTTP method %s is enabled and functional", m),
+							Severity:    "Medium",
+							Status:      "Failed",
+							Details:     fmt.Sprintf("Method %s returned status code %d", m, resp.StatusCode),
+						})
+						mutex.Unlock()
+					}
+				}
+			}(method)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		// Collect any errors
+		var errs []error
+		for err := range errChan {
+			if err != nil && !strings.Contains(err.Error(), "no such host") {
+				errs = append(errs, err)
 			}
+		}
+
+		if len(errs) > 0 {
+			return results, fmt.Errorf("multiple method test failures: %v", errs)
 		}
 	}
 
-	return results
+	return results, nil
 }
 
 // validateSQLInjection checks if SQL injection was successful

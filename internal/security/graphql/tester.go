@@ -1,9 +1,12 @@
 package graphql
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -17,6 +20,9 @@ type Tester struct {
 
 // New creates a new GraphQL tester instance
 func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
+	// Set reasonable timeouts
+	client.Timeout = 10 * time.Second
+
 	return &Tester{
 		logger:  logger,
 		client:  client,
@@ -28,9 +34,12 @@ func New(logger *logrus.Logger, client *http.Client, baseURL string) *Tester {
 func (t *Tester) RunTests(path string) error {
 	t.logger.Info("Starting GraphQL security tests")
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
 	tests := []struct {
 		name string
-		fn   func(string) error
+		fn   func(context.Context, string) error
 	}{
 		{"Schema Introspection", t.testSchemaIntrospection},
 		{"Field Suggestions", t.testFieldSuggestions},
@@ -39,20 +48,50 @@ func (t *Tester) RunTests(path string) error {
 		{"Batch Queries", t.testBatchQueries},
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(tests))
+
 	for _, test := range tests {
-		if err := test.fn(path); err != nil {
-			t.logger.Warnf("%s test failed: %v", test.name, err)
+		wg.Add(1)
+		go func(tt struct {
+			name string
+			fn   func(context.Context, string) error
+		}) {
+			defer wg.Done()
+			if err := tt.fn(ctx, path); err != nil {
+				if !strings.Contains(err.Error(), "no such host") {
+					t.logger.Warnf("%s test failed: %v", tt.name, err)
+					select {
+					case errChan <- err:
+					default:
+					}
+				}
+			}
+		}(test)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
 		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple test failures: %v", errs)
+	}
 	return nil
 }
 
 // testSchemaIntrospection tests for exposed schema information
-func (t *Tester) testSchemaIntrospection(path string) error {
+func (t *Tester) testSchemaIntrospection(ctx context.Context, path string) error {
 	query := `{__schema{types{name,kind,description,fields{name,type{name}}}}}`
 
-	resp, err := t.makeGraphQLRequest(path, query)
+	resp, err := t.makeGraphQLRequest(ctx, path, query)
 	if err != nil {
 		return err
 	}
@@ -66,30 +105,61 @@ func (t *Tester) testSchemaIntrospection(path string) error {
 }
 
 // testFieldSuggestions tests for field suggestion vulnerabilities
-func (t *Tester) testFieldSuggestions(path string) error {
+func (t *Tester) testFieldSuggestions(ctx context.Context, path string) error {
 	queries := []string{
 		`{__type(name:"User"){fields{name}}}`,
 		`{__type(name:"Admin"){fields{name}}}`,
 		`{__type(name:"Internal"){fields{name}}}`,
 	}
 
-	for _, query := range queries {
-		resp, err := t.makeGraphQLRequest(path, query)
-		if err != nil {
-			return err
-		}
-		resp.Body.Close()
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(queries))
 
-		if resp.StatusCode == http.StatusOK {
-			t.logger.Warnf("GraphQL field suggestions available for query: %s", query)
+	for _, query := range queries {
+		wg.Add(1)
+		go func(q string) {
+			defer wg.Done()
+
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				resp, err := t.makeGraphQLRequest(ctx, path, q)
+				if err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						errChan <- err
+					}
+					return
+				}
+				resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					t.logger.Warnf("GraphQL field suggestions available for query: %s", q)
+				}
+			}
+		}(query)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
 		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple field suggestion test failures: %v", errs)
+	}
 	return nil
 }
 
 // testQueryDepth tests for deep query vulnerabilities
-func (t *Tester) testQueryDepth(path string) error {
+func (t *Tester) testQueryDepth(ctx context.Context, path string) error {
 	// Create a deeply nested query
 	depth := 10
 	var query strings.Builder
@@ -103,7 +173,7 @@ func (t *Tester) testQueryDepth(path string) error {
 	}
 	query.WriteString("}")
 
-	resp, err := t.makeGraphQLRequest(path, query.String())
+	resp, err := t.makeGraphQLRequest(ctx, path, query.String())
 	if err != nil {
 		return err
 	}
@@ -117,7 +187,7 @@ func (t *Tester) testQueryDepth(path string) error {
 }
 
 // testQueryComplexity tests for query complexity limits
-func (t *Tester) testQueryComplexity(path string) error {
+func (t *Tester) testQueryComplexity(ctx context.Context, path string) error {
 	// Create a query with high complexity
 	query := `{
 		users(first: 100) {
@@ -141,7 +211,7 @@ func (t *Tester) testQueryComplexity(path string) error {
 		}
 	}`
 
-	resp, err := t.makeGraphQLRequest(path, query)
+	resp, err := t.makeGraphQLRequest(ctx, path, query)
 	if err != nil {
 		return err
 	}
@@ -155,7 +225,7 @@ func (t *Tester) testQueryComplexity(path string) error {
 }
 
 // testBatchQueries tests for batch query vulnerabilities
-func (t *Tester) testBatchQueries(path string) error {
+func (t *Tester) testBatchQueries(ctx context.Context, path string) error {
 	// Create a batch of queries
 	queries := []string{
 		`query { user(id: 1) { id } }`,
@@ -163,30 +233,71 @@ func (t *Tester) testBatchQueries(path string) error {
 		`query { user(id: 3) { id } }`,
 	}
 
-	batchQuery := fmt.Sprintf("[%s]", strings.Join(queries, ","))
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(queries))
 
-	resp, err := t.makeGraphQLRequest(path, batchQuery)
-	if err != nil {
-		return err
+	for _, query := range queries {
+		wg.Add(1)
+		go func(q string) {
+			defer wg.Done()
+
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				batchQuery := fmt.Sprintf("[%s]", q)
+				resp, err := t.makeGraphQLRequest(ctx, path, batchQuery)
+				if err != nil {
+					if !strings.Contains(err.Error(), "no such host") {
+						errChan <- err
+					}
+					return
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					t.logger.Warn("GraphQL batch queries are allowed")
+				}
+			}
+		}(query)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		t.logger.Warn("GraphQL batch queries are allowed")
+	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errs []error
+	for err := range errChan {
+		if err != nil && !strings.Contains(err.Error(), "no such host") {
+			errs = append(errs, err)
+		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple batch query test failures: %v", errs)
+	}
 	return nil
 }
 
 // makeGraphQLRequest performs a GraphQL request
-func (t *Tester) makeGraphQLRequest(path, query string) (*http.Response, error) {
+func (t *Tester) makeGraphQLRequest(ctx context.Context, path, query string) (*http.Response, error) {
 	payload := fmt.Sprintf(`{"query": "%s"}`, query)
-	req, err := http.NewRequest("POST", t.baseURL+path, strings.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", t.baseURL+path, strings.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
-	return t.client.Do(req)
+	resp, err := t.client.Do(req)
+	if err != nil {
+		// Skip DNS resolution errors
+		if strings.Contains(err.Error(), "no such host") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	return resp, nil
 }

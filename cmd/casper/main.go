@@ -1,11 +1,18 @@
 package main
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gregcmartin/casper/internal/business"
+	"github.com/gregcmartin/casper/internal/crawler"
 	"github.com/gregcmartin/casper/internal/reporter"
 	"github.com/gregcmartin/casper/internal/security"
 	"github.com/gregcmartin/casper/internal/validator"
@@ -115,6 +122,167 @@ var testCmd = &cobra.Command{
 	},
 }
 
+var discoverCmd = &cobra.Command{
+	Use:   "discover [domain or base URL]",
+	Short: "Discover APIs and API specifications in a domain",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		domain := args[0]
+
+		// Initialize crawler
+		c := crawler.New(logger)
+
+		// Discover APIs
+		result, err := c.DiscoverAPIs(domain)
+		if err != nil {
+			logger.Errorf("API discovery failed: %v", err)
+			os.Exit(1)
+		}
+
+		// Create a directory for downloaded specs
+		specsDir := "discovered_specs"
+		if err := os.MkdirAll(specsDir, 0755); err != nil {
+			logger.Errorf("Failed to create specs directory: %v", err)
+			os.Exit(1)
+		}
+
+		// Download discovered specs
+		var downloadedSpecs []string
+		if len(result.SpecURLs) > 0 {
+			logger.Info("Found API specifications:")
+			for _, specURL := range result.SpecURLs {
+				logger.Infof("- %s", specURL)
+
+				// Create a filename for the spec
+				parsedURL, err := url.Parse(specURL)
+				if err != nil {
+					logger.Warnf("Failed to parse spec URL: %v", err)
+					continue
+				}
+				filename := filepath.Join(specsDir, filepath.Base(parsedURL.Path))
+
+				// Download the spec
+				if err := downloadSpec(specURL, filename); err != nil {
+					logger.Warnf("Failed to download spec from %s: %v", specURL, err)
+					continue
+				}
+				downloadedSpecs = append(downloadedSpecs, filename)
+				logger.Infof("Downloaded spec to: %s", filename)
+			}
+		}
+
+		// If API endpoints were found without specs, test them directly
+		if len(result.APIEndpoints) > 0 {
+			logger.Info("Found API endpoints:")
+			for _, endpoint := range result.APIEndpoints {
+				logger.Infof("- %s", endpoint)
+			}
+		}
+
+		// Generate discovery report
+		if outputFile == "" {
+			// Parse the domain for a clean filename
+			parsedURL, err := url.Parse(domain)
+			if err != nil {
+				logger.Errorf("Failed to parse domain: %v", err)
+				os.Exit(1)
+			}
+
+			// Create a clean filename from the host
+			cleanDomain := strings.ReplaceAll(parsedURL.Host, ".", "-")
+			outputFile = fmt.Sprintf("casper-discovery-%s.json", cleanDomain)
+		}
+
+		// Create a map to store the full results
+		fullResult := map[string]interface{}{
+			"base_url":           result.BaseURL,
+			"spec_urls":          result.SpecURLs,
+			"api_endpoints":      result.APIEndpoints,
+			"swagger_ui":         result.SwaggerUI,
+			"documentation_urls": result.DocumentationURLs,
+			"headers":            result.Headers,
+			"downloaded_specs":   downloadedSpecs,
+		}
+
+		// Save discovery results
+		file, err := os.Create(outputFile)
+		if err != nil {
+			logger.Errorf("Failed to create report file: %v", err)
+			os.Exit(1)
+		}
+		defer file.Close()
+
+		if err := json.NewEncoder(file).Encode(fullResult); err != nil {
+			logger.Errorf("Failed to write discovery report: %v", err)
+			os.Exit(1)
+		}
+
+		logger.Infof("Discovery completed. Report saved to: %s", outputFile)
+
+		// If specs were found and downloaded, validate and test them
+		if len(downloadedSpecs) > 0 {
+			logger.Info("Starting validation and testing of discovered specs...")
+
+			v := validator.New(logger)
+			tester := security.New(logger, result.BaseURL)
+
+			for _, specPath := range downloadedSpecs {
+				logger.Infof("Validating and testing spec: %s", specPath)
+
+				// Validate spec
+				if err := v.ValidateSpec(specPath); err != nil {
+					logger.Warnf("Validation failed for %s: %v", specPath, err)
+					continue
+				}
+
+				// Run security tests
+				if err := tester.RunTests(specPath); err != nil {
+					logger.Warnf("Security testing failed for %s: %v", specPath, err)
+					continue
+				}
+			}
+		}
+	},
+}
+
+// downloadSpec downloads an API specification from a URL
+func downloadSpec(specURL, filename string) error {
+	// Create HTTP client with TLS verification disabled
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	// Download the spec
+	resp, err := client.Get(specURL)
+	if err != nil {
+		return fmt.Errorf("failed to download spec: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download spec: status code %d", resp.StatusCode)
+	}
+
+	// Create the file
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	// Copy the content
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
+}
+
 func init() {
 	// Setup logging
 	logger = logrus.New()
@@ -134,9 +302,14 @@ func init() {
 	testCmd.Flags().StringSliceVarP(&skipTests, "skip", "s", []string{},
 		"Skip specific test categories (security, business)")
 
+	// Add discover command flags
+	discoverCmd.Flags().StringVarP(&outputFile, "output", "o", "",
+		"Output file for the discovery report (default: casper-discovery-<domain>.json)")
+
 	// Add commands
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(testCmd)
+	rootCmd.AddCommand(discoverCmd)
 
 	// Set log level based on debug flag
 	cobra.OnInitialize(func() {
